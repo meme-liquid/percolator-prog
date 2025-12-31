@@ -1,7 +1,7 @@
 #[cfg(kani)]
 mod verification {
     use super::*;
-    use percolator::ix::Instruction;
+    use percolator_prog::ix::Instruction;
 
     #[kani::proof]
     fn verify_instruction_decoding() {

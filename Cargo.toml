@@ -1,12 +1,12 @@
 [package]
-name = "percolator"
+name = "percolator-prog"
 version = "0.1.0"
 edition = "2021"
 publish = false
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "percolator"
+name = "percolator_prog"
 path = "src/percolator.rs"
 
 [features]
@@ -24,6 +24,7 @@ pinocchio = "0.6" # Assuming standard registry version, otherwise will need to a
 arrayref = "0.3"
 num-derive = "0.4"
 num-traits = "0.2"
+percolator = { path = "../percolator" }
 
 [dev-dependencies]
 solana-program-test = "1.18"

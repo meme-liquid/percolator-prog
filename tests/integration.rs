@@ -7,15 +7,15 @@ use solana_sdk::{
     signature::Signer,
     transaction::Transaction,
 };
-use percolator::ix;
+use percolator_prog::ix;
 
 #[tokio::test]
 async fn test_init_market() {
     let program_id = Pubkey::new_unique();
     let (_banks_client, _payer, _recent_blockhash) = ProgramTest::new(
-        "percolator",
+        "percolator_prog",
         program_id,
-        processor!(percolator::processor::process_instruction),
+        processor!(percolator_prog::processor::process_instruction),
     )
     .start()
     .await;

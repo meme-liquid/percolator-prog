@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use percolator::ix::Instruction;
+    use percolator_prog::ix::Instruction;
     use solana_program::pubkey::Pubkey;
 
     #[test]

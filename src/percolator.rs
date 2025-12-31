@@ -315,6 +315,8 @@ pub mod processor {
 // 10. mod risk (Glue)
 pub mod risk {
     // Adapter to the Percolator engine
+    // use percolator; 
+    // To be implemented: wrapper functions calling percolator::* 
 }
 
 // 9. mod entrypoint
