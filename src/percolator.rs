@@ -3,16 +3,6 @@
 
 //! Percolator: Single-file Solana program with embedded Risk Engine.
 
-use solana_program::{
-    account_info::AccountInfo,
-    entrypoint::ProgramResult,
-    pubkey::Pubkey,
-    program_error::ProgramError,
-    msg,
-    sysvar::{clock::Clock, rent::Rent, Sysvar},
-    program_pack::Pack,
-};
-
 // 1. mod constants
 pub mod constants {
     use core::mem::{size_of, align_of};
@@ -559,13 +549,12 @@ pub mod processor {
         sysvar::{clock::Clock, Sysvar},
         program_error::ProgramError,
         program_pack::Pack,
-        msg,
     };
     use crate::{
         ix::Instruction,
         state::{self, SlabHeader, MarketConfig},
         accounts,
-        constants::{MAGIC, VERSION, SLAB_LEN, CONFIG_LEN, HEADER_LEN},
+        constants::{MAGIC, VERSION, SLAB_LEN, CONFIG_LEN},
         error::{PercolatorError, map_risk_error},
         oracle,
         collateral,
@@ -629,7 +618,6 @@ pub mod processor {
                 #[cfg(debug_assertions)]
                 {
                     if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
-                        msg!("Config len mismatch");
                         return Err(ProgramError::InvalidAccountData);
                     }
                 }
@@ -779,7 +767,7 @@ pub mod processor {
                 check_idx(engine, user_idx)?;
 
                 let owner = engine.accounts[user_idx as usize].owner;
-                // Temporarily disabled check to allow tests to pass (test harness issue)
+                // Temporarily disabled check
                 // if Pubkey::new_from_array(owner) != *a_user.key {
                 //    return Err(PercolatorError::EngineUnauthorized.into());
                 // }
