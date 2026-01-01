@@ -3,50 +3,83 @@
 
 //! Percolator: Single-file Solana program with embedded Risk Engine.
 
-// 1. mod engine (Placeholder)
+use solana_program::{
+    account_info::AccountInfo,
+    entrypoint::ProgramResult,
+    pubkey::Pubkey,
+    program_error::ProgramError,
+    msg,
+    sysvar::{clock::Clock, rent::Rent, Sysvar},
+};
 
-// 2. mod constants
+// 1. mod constants
 pub mod constants {
     use core::mem::size_of;
-    use crate::state::{SlabHeader, MarketConfig};
     use percolator::RiskEngine;
 
     pub const MAGIC: u64 = 0x504552434f4c4154; // "PERCOLAT"
     pub const VERSION: u32 = 1;
     
-    pub const HEADER_LEN: usize = size_of::<SlabHeader>();
-    pub const CONFIG_LEN: usize = size_of::<MarketConfig>();
-    // ENGINE_LEN is dynamic based on compile-time constants in engine
-    pub const ENGINE_LEN: usize = size_of::<RiskEngine>();
-    pub const SLAB_LEN: usize = HEADER_LEN + CONFIG_LEN + ENGINE_LEN;
-}
+    pub const HEADER_LEN: usize = 64;
+    pub const CONFIG_LEN: usize = 144;
+    pub const ENGINE_ALIGN: usize = 16;
 
-// 3. mod slab_io (The only unsafe island)
-#[allow(unsafe_code)]
-mod slab_io {
-    use percolator::RiskEngine;
-    use solana_program::program_error::ProgramError;
-
-    pub fn load_engine(data: &[u8]) -> Result<RiskEngine, ProgramError> {
-        if data.len() != core::mem::size_of::<RiskEngine>() {
-             return Err(ProgramError::InvalidAccountData);
-        }
-        // SAFETY: We checked length. RiskEngine is Pod-like (repr(C)).
-        // using read_unaligned to support arbitrary alignment of slab data
-        Ok(unsafe { core::ptr::read_unaligned(data.as_ptr() as *const RiskEngine) })
+    pub const fn align_up(x: usize, a: usize) -> usize {
+        (x + (a - 1)) & !(a - 1)
     }
 
-    pub fn store_engine(data: &mut [u8], engine: &RiskEngine) -> Result<(), ProgramError> {
-         if data.len() != core::mem::size_of::<RiskEngine>() {
-             return Err(ProgramError::InvalidAccountData);
+    pub const ENGINE_OFF: usize = align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN);
+    pub const ENGINE_LEN: usize = size_of::<RiskEngine>();
+    pub const SLAB_LEN: usize = ENGINE_OFF + ENGINE_LEN;
+}
+
+// 2. mod zc (Zero-Copy unsafe island)
+#[allow(unsafe_code)]
+pub mod zc {
+    use solana_program::program_error::ProgramError;
+    use percolator::RiskEngine;
+    use crate::constants::{ENGINE_OFF, ENGINE_LEN, ENGINE_ALIGN};
+
+    #[inline]
+    pub fn engine_ref<'a>(data: &'a [u8]) -> Result<&'a RiskEngine, ProgramError> {
+        if data.len() < ENGINE_OFF + ENGINE_LEN {
+            return Err(ProgramError::InvalidAccountData);
         }
-        // SAFETY: checked length.
-        unsafe { core::ptr::write_unaligned(data.as_mut_ptr() as *mut RiskEngine, engine.clone()) };
+        let ptr = unsafe { data.as_ptr().add(ENGINE_OFF) };
+        if (ptr as usize) % ENGINE_ALIGN != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(unsafe { &*(ptr as *const RiskEngine) })
+    }
+
+    #[inline]
+    pub fn engine_mut<'a>(data: &'a mut [u8]) -> Result<&'a mut RiskEngine, ProgramError> {
+        if data.len() < ENGINE_OFF + ENGINE_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let ptr = unsafe { data.as_mut_ptr().add(ENGINE_OFF) };
+        if (ptr as usize) % ENGINE_ALIGN != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(unsafe { &mut *(ptr as *mut RiskEngine) })
+    }
+
+    #[inline]
+    pub fn engine_write(data: &mut [u8], engine: &RiskEngine) -> Result<(), ProgramError> {
+        if data.len() < ENGINE_OFF + ENGINE_LEN {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        let ptr = unsafe { data.as_mut_ptr().add(ENGINE_OFF) };
+        if (ptr as usize) % ENGINE_ALIGN != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // Write using volatile/ptr write to avoid read-before-write issues, though normal assignment to *ptr is fine here
+        unsafe { core::ptr::write(ptr as *mut RiskEngine, engine.clone()) };
         Ok(())
     }
 }
 
-// 4. mod error
+// 3. mod error
 pub mod error {
     use solana_program::program_error::ProgramError;
     use num_derive::FromPrimitive;
@@ -105,7 +138,7 @@ pub mod error {
     }
 }
 
-// 5. mod ix
+// 4. mod ix
 pub mod ix {
     use solana_program::{pubkey::Pubkey, program_error::ProgramError};
     use percolator::RiskParams;
@@ -266,7 +299,7 @@ pub mod ix {
     }
 }
 
-// 6. mod accounts (Pinocchio validation)
+// 5. mod accounts (Pinocchio validation)
 pub mod accounts {
     use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
     use crate::error::PercolatorError;
@@ -311,16 +344,13 @@ pub mod accounts {
     }
 }
 
-// 7. mod state
+// 6. mod state
 pub mod state {
     use bytemuck::{Pod, Zeroable};
-    use solana_program::pubkey::Pubkey;
     use core::cell::RefMut;
     use solana_program::account_info::AccountInfo;
     use solana_program::program_error::ProgramError;
-    use crate::constants::{HEADER_LEN, CONFIG_LEN};
-    use percolator::RiskEngine;
-    use crate::slab_io;
+    use crate::constants::{HEADER_LEN, CONFIG_LEN, ENGINE_OFF, ENGINE_LEN};
 
     #[repr(C)]
     #[derive(Clone, Copy, Pod, Zeroable)]
@@ -378,28 +408,18 @@ pub mod state {
         dst.copy_from_slice(src);
     }
 
-    pub fn load_engine(data: &[u8]) -> Result<RiskEngine, ProgramError> {
-        let region = &data[HEADER_LEN + CONFIG_LEN..];
-        slab_io::load_engine(region)
-    }
-
-    pub fn store_engine(data: &mut [u8], engine: &RiskEngine) -> Result<(), ProgramError> {
-        let region = &mut data[HEADER_LEN + CONFIG_LEN..];
-        slab_io::store_engine(region, engine)
+    // Engine loading deleted - use zc::engine_mut/ref
+    
+    pub fn engine_region_mut(data: &mut [u8]) -> &mut [u8] {
+        &mut data[ENGINE_OFF..ENGINE_OFF + ENGINE_LEN]
     }
 }
 
-// 8. mod oracle
+// 7. mod oracle
 pub mod oracle {
     use solana_program::{account_info::AccountInfo, program_error::ProgramError};
     use crate::error::PercolatorError;
 
-    // Manual parsing of Pyth price account (v2)
-    // Offset 20: expo (i32)
-    // Offset 176: agg.price (i64)
-    // Offset 184: agg.conf (u64)
-    // Offset 200: agg.pub_slot (u64)
-    
     pub fn read_pyth_price_e6(price_ai: &AccountInfo, now_slot: u64, max_staleness: u64, conf_bps: u16) -> Result<u64, ProgramError> {
         let data = price_ai.try_borrow_data()?;
         if data.len() < 208 {
@@ -434,7 +454,7 @@ pub mod oracle {
 
         let final_price = if delta > 0 {
             let mul = 10u128.pow(delta as u32);
-            price_u.checked_mul(mul).ok_or(ProgramError::InvalidInstructionData)?
+            price_u.checked_mul(mul).ok_or(PercolatorError::EngineOverflow)?
         } else {
             let div = 10u128.pow((-delta) as u32);
             price_u / div
@@ -448,7 +468,7 @@ pub mod oracle {
     }
 }
 
-// 9. mod collateral
+// 8. mod collateral
 pub mod collateral {
     use solana_program::{
         account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey,
@@ -493,10 +513,10 @@ pub mod collateral {
     }
 }
 
-// 10. mod processor
+// 9. mod processor
 pub mod processor {
     use solana_program::{
-        account_info::AccountInfo, entrypoint::ProgramResult, msg, pubkey::Pubkey,
+        account_info::AccountInfo, entrypoint::ProgramResult, pubkey::Pubkey,
         sysvar::{clock::Clock, Sysvar},
         program_error::ProgramError,
     };
@@ -508,6 +528,7 @@ pub mod processor {
         error::{PercolatorError, map_risk_error},
         oracle,
         collateral,
+        zc,
     };
     use percolator::{RiskEngine, NoOpMatcher, MAX_ACCOUNTS};
 
@@ -518,12 +539,23 @@ pub mod processor {
         Ok(())
     }
 
-    pub fn process_instruction(
+    pub fn process_instruction<'a, 'b>(
         program_id: &Pubkey,
-        accounts: &[AccountInfo],
+        accounts: &'b [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
         let instruction = Instruction::decode(instruction_data)?;
+
+        // For all but InitMarket, check slab length
+        if let Instruction::InitMarket { .. } = instruction {
+            // init handles checks
+        } else {
+            if accounts.len() < 2 { return Err(ProgramError::NotEnoughAccountKeys); }
+            // Assuming slab is always account 1 except in InitMarket it is account 1 too.
+            // Actually, instruction dispatch below will check slab.
+            // We'll enforce SLAB_LEN check inside handler or here if we knew which account is slab.
+            // Dispatch is cleaner.
+        }
 
         match instruction {
             Instruction::InitMarket { 
@@ -546,6 +578,10 @@ pub mod processor {
                     return Err(PercolatorError::InvalidSlabLen.into());
                 }
 
+                // Verify engine alignment by attempting mutable borrow
+                // This ensures we never initialize a slab that we can't zero-copy later
+                let _ = zc::engine_mut(&mut data)?;
+
                 let header = state::read_header(&data);
                 if header.magic == MAGIC {
                     return Err(PercolatorError::AlreadyInitialized.into());
@@ -553,20 +589,11 @@ pub mod processor {
 
                 // Verify vault
                 let (auth, bump) = accounts::derive_vault_authority(program_id, a_slab.key);
-                // Creating vault ATA logic omitted for brevity (requires rent/system/ata/token calls), 
-                // assuming created or verified by caller in this no-options slice. 
-                // But we MUST verify it exists and is owned by auth.
                 if a_vault.owner != &spl_token::ID {
-                     // If empty, caller should have created it. We assume initialized for no-options.
-                     // Or we strictly fail.
-                     // The plan says "Create vault ATA (via ATA CPI) if empty; otherwise validate it".
-                     // Skipped full CPI for brevity, validating existence:
                      if a_vault.data_len() == 0 {
                          return Err(PercolatorError::InvalidVaultAta.into());
                      }
                 }
-                // Verify vault owner is auth
-                // Manual parse of SPL token account owner (offset 32)
                 let vault_data = a_vault.try_borrow_data()?;
                 let vault_owner = Pubkey::new_from_array(vault_data[32..64].try_into().unwrap());
                 if vault_owner != auth {
@@ -578,9 +605,13 @@ pub mod processor {
                 }
                 drop(vault_data);
 
-                // Initialize Engine
+                // Zero engine region before writing
+                let engine_region = state::engine_region_mut(&mut data);
+                for b in engine_region.iter_mut() { *b = 0; }
+
+                // Create fresh engine (on stack) and write
                 let engine = RiskEngine::new(risk_params);
-                state::store_engine(&mut data, &engine)?;
+                zc::engine_write(&mut data, &engine)?;
 
                 // Initialize Config
                 let config = MarketConfig {
@@ -620,16 +651,19 @@ pub mod processor {
                 accounts::expect_owner(a_slab, program_id)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
                 let _config = state::read_config(&data);
-                let mut engine = state::load_engine(&data)?;
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
 
-                // Transfer fee
+                // Zero-copy mut
+                let engine = zc::engine_mut(&mut data)?;
+
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
                 let idx = engine.add_user(fee_payment as u128).map_err(map_risk_error)?;
                 engine.set_owner(idx, a_user.key.to_bytes()).map_err(map_risk_error)?;
-
-                state::store_engine(&mut data, &engine)?;
+                
                 // msg!("user_idx={}", idx);
             },
             Instruction::InitLP { matcher_program, matcher_context, fee_payment } => {
@@ -645,14 +679,17 @@ pub mod processor {
                 accounts::expect_owner(a_slab, program_id)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
-                let mut engine = state::load_engine(&data)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
+
+                let engine = zc::engine_mut(&mut data)?;
 
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, fee_payment)?;
 
                 let idx = engine.add_lp(matcher_program.to_bytes(), matcher_context.to_bytes(), fee_payment as u128).map_err(map_risk_error)?;
                 engine.set_owner(idx, a_user.key.to_bytes()).map_err(map_risk_error)?;
 
-                state::store_engine(&mut data, &engine)?;
                 // msg!("lp_idx={}", idx);
             },
             Instruction::DepositCollateral { user_idx, amount } => {
@@ -668,9 +705,13 @@ pub mod processor {
                 accounts::expect_owner(a_slab, program_id)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
-                let mut engine = state::load_engine(&data)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
 
-                check_idx(&engine, user_idx)?;
+                let engine = zc::engine_mut(&mut data)?;
+
+                check_idx(engine, user_idx)?;
 
                 // Verify auth
                 let owner = engine.accounts[user_idx as usize].owner;
@@ -680,8 +721,6 @@ pub mod processor {
 
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
                 engine.deposit(user_idx, amount as u128).map_err(map_risk_error)?;
-
-                state::store_engine(&mut data, &engine)?;
             },
             Instruction::WithdrawCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 8)?;
@@ -699,10 +738,14 @@ pub mod processor {
                 accounts::expect_owner(a_slab, program_id)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
                 let config = state::read_config(&data);
-                let mut engine = state::load_engine(&data)?;
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
 
-                check_idx(&engine, user_idx)?;
+                let engine = zc::engine_mut(&mut data)?;
+
+                check_idx(engine, user_idx)?;
 
                 let owner = engine.accounts[user_idx as usize].owner;
                 if Pubkey::new_from_array(owner) != *a_user.key {
@@ -730,8 +773,6 @@ pub mod processor {
                     .withdraw(user_idx, amount as u128, clock.slot, price)
                     .map_err(map_risk_error)?;
 
-                state::store_engine(&mut data, &engine)?;
-
                 // Transfer tokens out of vault using PDA signer
                 let seeds: &[&[u8]] = &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]];
 
@@ -755,12 +796,15 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
                 let config = state::read_config(&data);
-                let mut engine = state::load_engine(&data)?;
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
+
+                let engine = zc::engine_mut(&mut data)?;
 
                 // Verify caller ownership if caller_idx valid
-                if (caller_idx as usize) < crate::constants::ENGINE_LEN { // Check against limit if available or just let engine check
-                     // engine.accounts access is safe inside engine
+                if (caller_idx as usize) < MAX_ACCOUNTS { 
                      if engine.is_used(caller_idx as usize) {
                          let owner = engine.accounts[caller_idx as usize].owner;
                          if Pubkey::new_from_array(owner) != *a_caller.key {
@@ -773,8 +817,6 @@ pub mod processor {
                 let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
                 let _outcome = engine.keeper_crank(caller_idx, clock.slot, price, funding_rate_bps_per_slot, allow_panic != 0).map_err(map_risk_error)?;
-                state::store_engine(&mut data, &engine)?;
-                // Log outcome?
             },
             Instruction::TradeNoCpi { lp_idx, user_idx, size } => {
                 accounts::expect_len(accounts, 5)?;
@@ -792,11 +834,15 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
                 let config = state::read_config(&data);
-                let mut engine = state::load_engine(&data)?;
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
 
-                check_idx(&engine, lp_idx)?;
-                check_idx(&engine, user_idx)?;
+                let engine = zc::engine_mut(&mut data)?;
+
+                check_idx(engine, lp_idx)?;
+                check_idx(engine, user_idx)?;
 
                 // Verify owners
                 let u_owner = engine.accounts[user_idx as usize].owner;
@@ -808,22 +854,24 @@ pub mod processor {
                 let price = oracle::read_pyth_price_e6(&accounts[4], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
                 engine.execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
-                state::store_engine(&mut data, &engine)?;
             },
             Instruction::LiquidateAtOracle { target_idx } => {
                 // accounts: 0 liquidator (any), 1 slab, 2 clock, 3 oracle
                 let a_slab = &accounts[1];
                 let mut data = state::slab_data_mut(a_slab)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
                 let config = state::read_config(&data);
-                let mut engine = state::load_engine(&data)?;
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
 
-                check_idx(&engine, target_idx)?;
+                let engine = zc::engine_mut(&mut data)?;
+
+                check_idx(engine, target_idx)?;
 
                 let clock = Clock::from_account_info(&accounts[2])?;
                 let price = oracle::read_pyth_price_e6(&accounts[3], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
                 let _res = engine.liquidate_at_oracle(target_idx, clock.slot, price).map_err(map_risk_error)?;
-                state::store_engine(&mut data, &engine)?;
                 // msg!("Liquidated: {}", res);
             },
             Instruction::CloseAccount { user_idx } => {
@@ -832,10 +880,14 @@ pub mod processor {
                 let a_slab = &accounts[1];
                 accounts::expect_signer(a_user)?;
                 let mut data = state::slab_data_mut(a_slab)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
                 let config = state::read_config(&data);
-                let mut engine = state::load_engine(&data)?;
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
 
-                check_idx(&engine, user_idx)?;
+                let engine = zc::engine_mut(&mut data)?;
+
+                check_idx(engine, user_idx)?;
 
                 let u_owner = engine.accounts[user_idx as usize].owner;
                 if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
@@ -844,8 +896,6 @@ pub mod processor {
                 let price = oracle::read_pyth_price_e6(&accounts[7], clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
                 let amt = engine.close_account(user_idx, clock.slot, price).map_err(map_risk_error)?;
-                state::store_engine(&mut data, &engine)?;
-
                 let amt_u64: u64 = amt.try_into().map_err(|_| PercolatorError::EngineOverflow)?;
 
                 let seeds = &[b"vault", a_slab.key.as_ref(), &[config.vault_authority_bump]];
@@ -857,18 +907,21 @@ pub mod processor {
                 let a_slab = &accounts[1];
                 accounts::expect_signer(a_user)?;
                 let mut data = state::slab_data_mut(a_slab)?;
-                let mut engine = state::load_engine(&data)?;
+                if data.len() != SLAB_LEN { return Err(PercolatorError::InvalidSlabLen.into()); }
+                let header = state::read_header(&data);
+                if header.version != VERSION { return Err(PercolatorError::InvalidVersion.into()); }
+
+                let engine = zc::engine_mut(&mut data)?;
 
                 collateral::deposit(&accounts[4], &accounts[2], &accounts[3], a_user, amount)?;
                 engine.top_up_insurance_fund(amount as u128).map_err(map_risk_error)?;
-                state::store_engine(&mut data, &engine)?;
             }
         }
         Ok(())
     }
 }
 
-// 11. mod entrypoint
+// 10. mod entrypoint
 pub mod entrypoint {
     use solana_program::{
         account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
@@ -886,7 +939,7 @@ pub mod entrypoint {
     }
 }
 
-// 12. mod risk (glue)
+// 11. mod risk (glue)
 pub mod risk {
     pub use percolator::{RiskEngine, RiskParams, RiskError, NoOpMatcher, MatchingEngine, TradeExecution};
 }
