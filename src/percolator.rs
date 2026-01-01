@@ -911,6 +911,7 @@ pub mod processor {
                 accounts::expect_writable(a_slab)?;
                 accounts::expect_writable(a_context)?;
                 if a_context.executable { return Err(ProgramError::InvalidAccountData); }
+                if a_context.data_len() < MATCHER_CONTEXT_LEN { return Err(ProgramError::InvalidAccountData); }
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -1107,7 +1108,6 @@ mod tests {
     extern crate std;
     extern crate alloc;
     use alloc::{vec, vec::Vec};
-    use super::*;
     use solana_program::{
         account_info::AccountInfo,
         pubkey::Pubkey,
@@ -1386,10 +1386,77 @@ mod tests {
             process_instruction(&f.program_id, &accs, &encode_trade_cpi(lp_idx, user_idx, 100))
         }));
         
-        let inner = res.unwrap(); // Expect no panic
-        if let Err(ProgramError::Custom(15)) = inner {
-            panic!("PDA check failed (Unauthorized)");
+        match res {
+            Ok(Ok(_)) => panic!("unexpected success: CPI shouldn't succeed in unit tests"),
+            Ok(Err(e)) => {
+                // Must NOT be EngineUnauthorized
+                assert_ne!(e, ProgramError::Custom(PercolatorError::EngineUnauthorized as u32));
+            }
+            Err(_) => {
+                // Panic is acceptable here (invoke_signed syscall not supported)
+            }
         }
+    }
+
+    #[test]
+    fn test_trade_cpi_wrong_lp_pda_rejected() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 1000)).writable();
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        let mut lp = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, lp.key, 1000)).writable();
+        let mut matcher_program = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let mut matcher_ctx = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        {
+            let matcher_prog_key = matcher_program.key;
+            let matcher_ctx_key = matcher_ctx.key;
+            let accs = vec![
+                lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                matcher_program.to_info(), matcher_ctx.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
+        }
+        let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+
+        // Use WRONG PDA
+        let mut lp_pda_acc = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]); 
+
+        matcher_ctx.data = vec![0u8; 24];
+        matcher_ctx.is_writable = true;
+
+        let accs = vec![
+            user.to_info(), // 0
+            lp.to_info(), // 1
+            f.slab.to_info(), // 2
+            f.clock.to_info(), // 3
+            f.pyth_index.to_info(), // 4 oracle
+            matcher_program.to_info(), // 5 matcher
+            matcher_ctx.to_info(), // 6 context
+            lp_pda_acc.to_info(), // 7 lp_signer_pda (WRONG KEY)
+        ];
+
+        // Should fail with EngineUnauthorized because PDA key is wrong
+        let res = process_instruction(&f.program_id, &accs, &encode_trade_cpi(lp_idx, user_idx, 100));
+        assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
     }
 
     // --- Tests ---
