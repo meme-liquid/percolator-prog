@@ -575,7 +575,14 @@ pub mod processor {
     }
 
     impl MatchingEngine for CpiMatcher {
-        fn execute_match(&self, _slab: &[u8; 32], _lp: &[u8; 32], _lp_id: u64, _price: u64, _size: i128) -> Result<TradeExecution, RiskError> {
+        fn execute_match(
+            &self,
+            _lp_program: &[u8; 32],
+            _lp_context: &[u8; 32],
+            _lp_account_id: u64,
+            _oracle_price: u64,
+            _size: i128,
+        ) -> Result<TradeExecution, RiskError> {
             Ok(TradeExecution {
                 price: self.exec_price,
                 size: self.exec_size,
@@ -903,7 +910,7 @@ pub mod processor {
                 accounts::expect_signer(a_lp)?;
                 accounts::expect_writable(a_slab)?;
                 accounts::expect_writable(a_context)?;
-                accounts::expect_signer(a_lp_signer)?;
+                // LP signer verified by PDA check
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
@@ -919,6 +926,8 @@ pub mod processor {
                 if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
                 let l_owner = engine.accounts[lp_idx as usize].owner;
                 if Pubkey::new_from_array(l_owner) != *a_lp.key { return Err(PercolatorError::EngineUnauthorized.into()); }
+
+                accounts::expect_key(a_oracle, &Pubkey::new_from_array(config.index_oracle))?;
 
                 let lp_bytes = lp_idx.to_le_bytes();
                 let (lp_pda, bump) = Pubkey::find_program_address(
@@ -944,7 +953,7 @@ pub mod processor {
 
                 let mut metas = alloc::vec![
                     AccountMeta::new_readonly(*a_slab.key, false),
-                    AccountMeta::new(*a_lp_signer.key, true),
+                    AccountMeta::new_readonly(*a_lp_signer.key, true),
                     AccountMeta::new(*a_context.key, false),
                 ];
                 for i in 8..accounts.len() {
@@ -961,7 +970,16 @@ pub mod processor {
                 let bump_arr = [bump];
                 let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
                 
-                invoke_signed(&ix, accounts, &[seeds])?;
+                let mut cpi_infos: alloc::vec::Vec<AccountInfo> = alloc::vec::Vec::with_capacity(4 + (accounts.len().saturating_sub(8)));
+                cpi_infos.push(a_slab.clone());
+                cpi_infos.push(a_lp_signer.clone());
+                cpi_infos.push(a_context.clone());
+                for i in 8..accounts.len() {
+                    cpi_infos.push(accounts[i].clone());
+                }
+                cpi_infos.push(a_matcher.clone());
+
+                invoke_signed(&ix, &cpi_infos, &[seeds])?;
 
                 if a_context.data_len() < MATCHER_CONTEXT_LEN {
                     return Err(ProgramError::InvalidAccountData);
