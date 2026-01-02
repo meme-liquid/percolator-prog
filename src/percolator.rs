@@ -80,6 +80,36 @@ pub mod zc {
         unsafe { core::ptr::write(ptr as *mut RiskEngine, engine) };
         Ok(())
     }
+
+    use solana_program::{
+        account_info::AccountInfo,
+        instruction::Instruction as SolInstruction,
+        program::invoke_signed,
+    };
+
+    /// Invoke the matcher program via CPI with proper lifetime coercion.
+    ///
+    /// This is the ONLY place where unsafe lifetime transmute is allowed.
+    /// The transmute is sound because:
+    /// - We are shortening lifetime from 'a (caller) to local scope
+    /// - The AccountInfo is only used for the duration of invoke_signed
+    /// - We don't hold references past the function call
+    #[inline]
+    #[allow(unsafe_code)]
+    pub fn invoke_signed_trade<'a>(
+        ix: &SolInstruction,
+        a_slab: &AccountInfo<'a>,
+        a_lp_pda: &AccountInfo<'a>,
+        a_matcher_ctx: &AccountInfo<'a>,
+        seeds: &[&[u8]],
+    ) -> Result<(), ProgramError> {
+        // SAFETY: All three AccountInfos have lifetime 'a from the caller.
+        // We clone them to get owned values (still with 'a lifetime internally).
+        // The invoke_signed call consumes them by reference and returns.
+        // No lifetime extension occurs.
+        let infos = [a_slab.clone(), a_lp_pda.clone(), a_matcher_ctx.clone()];
+        invoke_signed(ix, &infos, &[seeds])
+    }
 }
 
 pub mod matcher_abi {
@@ -455,6 +485,21 @@ pub mod state {
         dst.copy_from_slice(src);
     }
 
+    /// Read the request nonce from the reserved field in slab header.
+    /// The nonce is stored in _reserved[0..8] as little-endian u64.
+    pub fn read_req_nonce(data: &[u8]) -> u64 {
+        let h = read_header(data);
+        u64::from_le_bytes(h._reserved[0..8].try_into().unwrap())
+    }
+
+    /// Write the request nonce to the reserved field in slab header.
+    /// The nonce is stored in _reserved[0..8] as little-endian u64.
+    pub fn write_req_nonce(data: &mut [u8], nonce: u64) {
+        // Offset of _reserved in SlabHeader: magic(8) + version(4) + bump(1) + _padding(3) + admin(32) = 48
+        const NONCE_OFF: usize = 48;
+        data[NONCE_OFF..NONCE_OFF + 8].copy_from_slice(&nonce.to_le_bytes());
+    }
+
     pub fn read_config(data: &[u8]) -> MarketConfig {
         let mut c = MarketConfig::zeroed();
         let src = &data[HEADER_LEN..HEADER_LEN + CONFIG_LEN];
@@ -628,7 +673,6 @@ pub mod processor {
     };
     use percolator::{RiskEngine, NoOpMatcher, MAX_ACCOUNTS, MatchingEngine, TradeExecution, RiskError};
     use solana_program::instruction::{Instruction as SolInstruction, AccountMeta};
-    use solana_program::program::invoke_signed;
 
     struct CpiMatcher {
         exec_price: u64,
@@ -683,7 +727,6 @@ pub mod processor {
         Ok(())
     }
 
-    #[allow(unsafe_code)]
     pub fn process_instruction<'a, 'b>(
         program_id: &Pubkey,
         accounts: &'b [AccountInfo<'a>],
@@ -958,7 +1001,8 @@ pub mod processor {
                 engine.execute_trade(&NoOpMatcher, lp_idx, user_idx, clock.slot, price, size).map_err(map_risk_error)?;
             },
             Instruction::TradeCpi { lp_idx, user_idx, size } => {
-                accounts::expect_len(accounts, 7)?;
+                // Phase 1: Updated account layout - lp_pda must be in accounts
+                accounts::expect_len(accounts, 8)?;
                 let a_user = &accounts[0];
                 let a_lp_owner = &accounts[1];
                 let a_slab = &accounts[2];
@@ -966,22 +1010,47 @@ pub mod processor {
                 let a_oracle = &accounts[4];
                 let a_matcher_prog = &accounts[5];
                 let a_matcher_ctx = &accounts[6];
+                let a_lp_pda = &accounts[7];
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_signer(a_lp_owner)?;
                 accounts::expect_writable(a_slab)?;
                 accounts::expect_writable(a_matcher_ctx)?;
-                
+
                 if !a_matcher_prog.executable { return Err(ProgramError::InvalidAccountData); }
                 if a_matcher_ctx.executable { return Err(ProgramError::InvalidAccountData); }
                 if a_matcher_ctx.owner != a_matcher_prog.key { return Err(ProgramError::IllegalOwner); }
                 if a_matcher_ctx.data_len() < MATCHER_CONTEXT_LEN { return Err(ProgramError::InvalidAccountData); }
 
-                let (lp_account_id, config) = {
+                // Phase 1: Validate lp_pda is the correct PDA, system-owned, empty data
+                let lp_bytes = lp_idx.to_le_bytes();
+                let (expected_lp_pda, bump) = Pubkey::find_program_address(
+                    &[b"lp", a_slab.key.as_ref(), &lp_bytes],
+                    program_id
+                );
+                if a_lp_pda.key != &expected_lp_pda {
+                    return Err(ProgramError::InvalidSeeds);
+                }
+                if a_lp_pda.owner != &solana_program::system_program::ID {
+                    return Err(ProgramError::IllegalOwner);
+                }
+                if a_lp_pda.data_len() != 0 {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                // Phase 3 & 4: Read engine state, generate nonce, validate matcher identity
+                let (lp_account_id, config, req_id, lp_matcher_prog, lp_matcher_ctx) = {
                     let mut data = state::slab_data_mut(a_slab)?;
                     slab_guard(program_id, a_slab, &data)?;
                     require_initialized(&data)?;
                     let config = state::read_config(&data);
+
+                    // Phase 3: Read and increment monotonic nonce for req_id
+                    let nonce = state::read_req_nonce(&data);
+                    let new_nonce = nonce.wrapping_add(1);
+                    state::write_req_nonce(&mut data, new_nonce);
+                    let req_id = new_nonce; // Option A: simple monotonic nonce
+
                     let engine = zc::engine_ref(&data)?;
 
                     check_idx(engine, lp_idx)?;
@@ -991,36 +1060,29 @@ pub mod processor {
                     if Pubkey::new_from_array(u_owner) != *a_user.key { return Err(PercolatorError::EngineUnauthorized.into()); }
                     let l_owner = engine.accounts[lp_idx as usize].owner;
                     if Pubkey::new_from_array(l_owner) != *a_lp_owner.key { return Err(PercolatorError::EngineUnauthorized.into()); }
-                    
-                    (engine.accounts[lp_idx as usize].account_id, config)
+
+                    let lp_acc = &engine.accounts[lp_idx as usize];
+                    (lp_acc.account_id, config, req_id, lp_acc.matcher_program, lp_acc.matcher_context)
                 };
+
+                // Phase 4: Enforce matcher program/context match what LP registered
+                if a_matcher_prog.key.to_bytes() != lp_matcher_prog {
+                    return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+                }
+                if a_matcher_ctx.key.to_bytes() != lp_matcher_ctx {
+                    return Err(PercolatorError::EngineInvalidMatchingEngine.into());
+                }
 
                 accounts::expect_key(a_oracle, &Pubkey::new_from_array(config.index_oracle))?;
 
-                let lp_bytes = lp_idx.to_le_bytes();
-                let (lp_pda, bump) = Pubkey::find_program_address(
-                    &[b"lp", a_slab.key.as_ref(), &lp_bytes],
-                    program_id
-                );
-                
-                let mut lp_lamports = 0;
-                let mut lp_data = [];
-                let lp_owner = solana_program::system_program::ID;
-                let a_lp_pda = AccountInfo::new(
-                    &lp_pda,
-                    true, 
-                    false, 
-                    &mut lp_lamports,
-                    &mut lp_data,
-                    &lp_owner,
-                    false, 
-                    0,
-                );
-
                 let clock = Clock::from_account_info(a_clock)?;
                 let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
-                
-                let req_id = lp_account_id.wrapping_add(price).wrapping_add(size as u64).wrapping_add(clock.slot);
+
+                // Phase 5: Zero context prefix before CPI (prevents stale data)
+                {
+                    let mut ctx_data = a_matcher_ctx.try_borrow_mut_data()?;
+                    ctx_data[..MATCHER_CONTEXT_PREFIX_LEN].fill(0);
+                }
 
                 let mut cpi_data = alloc::vec::Vec::with_capacity(MATCHER_CALL_LEN);
                 cpi_data.push(MATCHER_CALL_TAG);
@@ -1029,7 +1091,7 @@ pub mod processor {
                 cpi_data.extend_from_slice(&lp_account_id.to_le_bytes());
                 cpi_data.extend_from_slice(&price.to_le_bytes());
                 cpi_data.extend_from_slice(&size.to_le_bytes());
-                cpi_data.extend_from_slice(&[0u8; 24]); // padding to 67
+                cpi_data.extend_from_slice(&[0u8; 24]); // padding to MATCHER_CALL_LEN
 
                 #[cfg(debug_assertions)]
                 {
@@ -1038,9 +1100,9 @@ pub mod processor {
                     }
                 }
 
-                let mut metas = alloc::vec![
+                let metas = alloc::vec![
                     AccountMeta::new_readonly(*a_slab.key, false),
-                    AccountMeta::new_readonly(lp_pda, true),
+                    AccountMeta::new_readonly(*a_lp_pda.key, true), // Will become signer via invoke_signed
                     AccountMeta::new(*a_matcher_ctx.key, false),
                 ];
 
@@ -1052,17 +1114,9 @@ pub mod processor {
 
                 let bump_arr = [bump];
                 let seeds: &[&[u8]] = &[b"lp", a_slab.key.as_ref(), &lp_bytes, &bump_arr];
-                
-                // SAFETY: AccountInfo is invariant in 'a, so we cannot automatically coerce 'a to 'local.
-                // We must mix 'a (slab) and 'local (lp_pda) in the same array for invoke_signed.
-                // We cannot use AccountInfo::new() on slab because it requires borrowing the data,
-                // which causes RefCell panic (AccountBorrowFailed) in the callee.
-                // Therefore, we transmute the lifetime. This is sound because we are shortening the lifetime,
-                // and we do not mutate the AccountInfo structure itself (just the data inside Rc/RefCell).
-                let a_slab_local: AccountInfo = unsafe { core::mem::transmute(a_slab.clone()) };
-                let a_ctx_local: AccountInfo = unsafe { core::mem::transmute(a_matcher_ctx.clone()) };
 
-                invoke_signed(&ix, &[a_slab_local, a_lp_pda, a_ctx_local], &[seeds])?;
+                // Phase 2: Use zc helper for CPI - no unsafe in processor
+                zc::invoke_signed_trade(&ix, a_slab, a_lp_pda, a_matcher_ctx, seeds)?;
 
                 let ctx_data = a_matcher_ctx.try_borrow_data()?;
                 let ret = crate::matcher_abi::read_matcher_return(&ctx_data)?;
@@ -1173,7 +1227,6 @@ pub mod entrypoint {
 
     entrypoint!(process_instruction);
 
-    #[allow(unsafe_code)]
     fn process_instruction<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
@@ -1737,10 +1790,26 @@ mod tests {
         }
         let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
 
-        // Update context to have valid ABI return
-        matcher_ctx.data[0] = 1; // ver
-        matcher_ctx.data[4] = 1; // flags
-        matcher_ctx.data[8] = 1; // price
+        // Create lp_pda account (system-owned, 0 data)
+        let lp_bytes = lp_idx.to_le_bytes();
+        let (lp_pda_key, _) = Pubkey::find_program_address(
+            &[b"lp", f.slab.key.as_ref(), &lp_bytes],
+            &f.program_id
+        );
+        let mut lp_pda = TestAccount::new(lp_pda_key, solana_program::system_program::id(), 0, vec![]);
+
+        // Update context to have valid ABI return with correct req_id (nonce = 1)
+        matcher_ctx.data[0..4].copy_from_slice(&1u32.to_le_bytes()); // abi_version
+        matcher_ctx.data[4..8].copy_from_slice(&1u32.to_le_bytes()); // flags (VALID)
+        matcher_ctx.data[8..16].copy_from_slice(&1u64.to_le_bytes()); // exec_price_e6
+        matcher_ctx.data[16..32].copy_from_slice(&100i128.to_le_bytes()); // exec_size
+        matcher_ctx.data[32..40].copy_from_slice(&1u64.to_le_bytes()); // req_id (nonce = 1)
+        // lp_account_id at 40..48 - read from engine
+        let engine = zc::engine_ref(&f.slab.data).unwrap();
+        let lp_account_id = engine.accounts[lp_idx as usize].account_id;
+        matcher_ctx.data[40..48].copy_from_slice(&lp_account_id.to_le_bytes());
+        matcher_ctx.data[48..56].copy_from_slice(&1u64.to_le_bytes()); // oracle_price_e6
+        matcher_ctx.data[56..64].copy_from_slice(&0u64.to_le_bytes()); // reserved
 
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let out = {
@@ -1752,12 +1821,13 @@ mod tests {
                     f.pyth_index.to_info(), // 4 oracle
                     matcher_program.to_info(), // 5 matcher
                     matcher_ctx.to_info(), // 6 context
+                    lp_pda.to_info(), // 7 lp_pda
                 ];
                 process_instruction(&f.program_id, &accs, &encode_trade_cpi(lp_idx, user_idx, 100))
             };
             out
         }));
-        
+
         match res {
             Ok(Ok(_)) => {}, // Success
             Ok(Err(e)) => {
@@ -1810,6 +1880,14 @@ mod tests {
 
         let mut wrong_lp = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
 
+        // Create lp_pda account (system-owned, 0 data)
+        let lp_bytes = lp_idx.to_le_bytes();
+        let (lp_pda_key, _) = Pubkey::find_program_address(
+            &[b"lp", f.slab.key.as_ref(), &lp_bytes],
+            &f.program_id
+        );
+        let mut lp_pda = TestAccount::new(lp_pda_key, solana_program::system_program::id(), 0, vec![]);
+
         let res = {
             let accs = vec![
                 user.to_info(), // 0
@@ -1819,6 +1897,7 @@ mod tests {
                 f.pyth_index.to_info(), // 4 oracle
                 matcher_program.to_info(), // 5 matcher
                 matcher_ctx.to_info(), // 6 context
+                lp_pda.to_info(), // 7 lp_pda
             ];
             process_instruction(&f.program_id, &accs, &encode_trade_cpi(lp_idx, user_idx, 100))
         };
@@ -1868,6 +1947,14 @@ mod tests {
 
         let mut wrong_oracle = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![0u8; 208]);
 
+        // Create lp_pda account (system-owned, 0 data)
+        let lp_bytes = lp_idx.to_le_bytes();
+        let (lp_pda_key, _) = Pubkey::find_program_address(
+            &[b"lp", f.slab.key.as_ref(), &lp_bytes],
+            &f.program_id
+        );
+        let mut lp_pda = TestAccount::new(lp_pda_key, solana_program::system_program::id(), 0, vec![]);
+
         let res = {
             let accs = vec![
                 user.to_info(), // 0
@@ -1877,6 +1964,7 @@ mod tests {
                 wrong_oracle.to_info(), // 4 oracle (WRONG KEY)
                 matcher_program.to_info(), // 5 matcher
                 matcher_ctx.to_info(), // 6 context
+                lp_pda.to_info(), // 7 lp_pda
             ];
             process_instruction(&f.program_id, &accs, &encode_trade_cpi(lp_idx, user_idx, 100))
         };
