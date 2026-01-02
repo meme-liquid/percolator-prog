@@ -20,11 +20,12 @@ use percolator_prog::{
     processor as percolator_processor,
     zc,
 };
+use percolator::MAX_ACCOUNTS;
 
 pub const PERCOLATOR_ID: Pubkey = solana_program::pubkey!("Perco1ator111111111111111111111111111111111");
 
 fn matcher_mock_process_instruction(
-    _program_id: &Pubkey,
+    program_id: &Pubkey,
     accounts: &[AccountInfo],
     data: &[u8],
 ) -> ProgramResult {
@@ -32,16 +33,22 @@ fn matcher_mock_process_instruction(
     let a_slab = &accounts[0];
     let a_lp_pda = &accounts[1];
     let a_ctx = &accounts[2];
+
     if !a_lp_pda.is_signer { return Err(ProgramError::MissingRequiredSignature); }
     if !a_ctx.is_writable { return Err(ProgramError::InvalidAccountData); }
+    if a_ctx.owner != program_id { return Err(ProgramError::IllegalOwner); }
     if a_ctx.data_len() < MATCHER_CONTEXT_LEN { return Err(ProgramError::InvalidAccountData); }
+
     if data.len() != 67 { return Err(ProgramError::InvalidInstructionData); }
     let tag = data[0];
     if tag != 0 { return Err(ProgramError::InvalidInstructionData); }
+
     let slab_pk = Pubkey::new_from_array(data[1..33].try_into().unwrap());
     if slab_pk != *a_slab.key { return Err(ProgramError::InvalidArgument); }
+
     let oracle_price_e6 = u64::from_le_bytes(data[43..51].try_into().unwrap());
     let req_size = i128::from_le_bytes(data[51..67].try_into().unwrap());
+
     {
         let mut ctx = a_ctx.try_borrow_mut_data()?;
         ctx[0..8].copy_from_slice(&oracle_price_e6.to_le_bytes());
@@ -67,19 +74,19 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, pyth_index: &Pubkey, pyth_c
     v.extend_from_slice(pyth_collateral.as_ref());
     v.extend_from_slice(&max_staleness.to_le_bytes());
     v.extend_from_slice(&conf_bps.to_le_bytes());
-    v.extend_from_slice(&0u64.to_le_bytes()); // RiskParams...
-    v.extend_from_slice(&0u64.to_le_bytes());
-    v.extend_from_slice(&0u64.to_le_bytes());
-    v.extend_from_slice(&0u64.to_le_bytes());
-    v.extend_from_slice(&64u64.to_le_bytes());
-    v.extend_from_slice(&0u128.to_le_bytes());
-    v.extend_from_slice(&0u128.to_le_bytes());
-    v.extend_from_slice(&0u128.to_le_bytes());
-    v.extend_from_slice(&crank_staleness.to_le_bytes());
-    v.extend_from_slice(&0u64.to_le_bytes());
-    v.extend_from_slice(&0u128.to_le_bytes());
-    v.extend_from_slice(&0u64.to_le_bytes());
-    v.extend_from_slice(&0u128.to_le_bytes());
+    v.extend_from_slice(&0u64.to_le_bytes()); // warmup
+    v.extend_from_slice(&0u64.to_le_bytes()); // maint
+    v.extend_from_slice(&0u64.to_le_bytes()); // init
+    v.extend_from_slice(&0u64.to_le_bytes()); // trade
+    v.extend_from_slice(&64u64.to_le_bytes()); // max_accounts
+    v.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    v.extend_from_slice(&0u128.to_le_bytes()); // risk_threshold
+    v.extend_from_slice(&0u128.to_le_bytes()); // maint_fee_per_slot
+    v.extend_from_slice(&crank_staleness.to_le_bytes()); 
+    v.extend_from_slice(&0u64.to_le_bytes()); // liq_fee_bps
+    v.extend_from_slice(&0u128.to_le_bytes()); // liq_fee_cap
+    v.extend_from_slice(&0u64.to_le_bytes()); // liq_buffer_bps
+    v.extend_from_slice(&0u128.to_le_bytes()); // min_liq_abs
     v
 }
 
@@ -153,7 +160,7 @@ async fn integration_trade_cpi_lp_pda_is_signer() {
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
-    let (mut banks, payer, recent_hash) = pt.start().await;
+    let (mut banks, payer, _recent_hash) = pt.start().await;
 
     let ix = Instruction {
         program_id: percolator_id,
@@ -161,7 +168,7 @@ async fn integration_trade_cpi_lp_pda_is_signer() {
         data: encode_init_market(&admin.pubkey(), &mint, &pyth_index, &pyth_collateral, 100, 500, 100),
     };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
-    tx.sign(&[&payer, &admin], recent_hash);
+    tx.sign(&[&payer, &admin], banks.get_latest_blockhash().await.unwrap());
     banks.process_transaction(tx).await.unwrap();
 
     let ix = Instruction {
@@ -184,8 +191,8 @@ async fn integration_trade_cpi_lp_pda_is_signer() {
 
     let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
     let engine = zc::engine_ref(&slab_acc.data).unwrap();
-    let user_idx = (0..64).find(|&i| engine.is_used(i) && engine.accounts[i].owner == user.pubkey().to_bytes()).unwrap() as u16;
-    let lp_idx = (0..64).find(|&i| engine.is_used(i) && engine.accounts[i].owner == lp.pubkey().to_bytes()).unwrap() as u16;
+    let user_idx = (0..MAX_ACCOUNTS).find(|&i| engine.is_used(i) && engine.accounts[i].owner == user.pubkey().to_bytes()).unwrap() as u16;
+    let lp_idx = (0..MAX_ACCOUNTS).find(|&i| engine.is_used(i) && engine.accounts[i].owner == lp.pubkey().to_bytes()).unwrap() as u16;
 
     let ix = Instruction {
         program_id: percolator_id,
@@ -226,13 +233,18 @@ async fn integration_trade_cpi_wrong_lp_pda_rejected() {
     let pyth_index = Pubkey::new_unique();
     let pyth_collateral = Pubkey::new_unique();
     let matcher_ctx = Keypair::new();
-    let (vault_auth, _) = Pubkey::find_program_address(&[b"vault", slab.pubkey().as_ref()], &percolator_id);
-    let vault = Pubkey::new_unique();
     let user_ata = Pubkey::new_unique();
     let lp_ata = Pubkey::new_unique();
+    let vault = Pubkey::new_unique();
     let dummy_ata = Pubkey::new_unique();
 
     pt.add_account(slab.pubkey(), Account { lamports: 10_000_000_000, data: vec![0u8; SLAB_LEN], owner: percolator_id, executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
+    pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
+    
+    let (vault_auth, _) = Pubkey::find_program_address(&[b"vault", slab.pubkey().as_ref()], &percolator_id);
     let mut token_data = vec![0u8; spl_token::state::Account::LEN];
     let mut token_state = spl_token::state::Account::default();
     token_state.mint = mint;
@@ -246,12 +258,8 @@ async fn integration_trade_cpi_wrong_lp_pda_rejected() {
     token_state.owner = lp.pubkey();
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
-    pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
-    let (mut banks, payer, recent_hash) = pt.start().await;
+    let (mut banks, payer, _recent_hash) = pt.start().await;
 
     let ix = Instruction {
         program_id: percolator_id,
@@ -259,7 +267,7 @@ async fn integration_trade_cpi_wrong_lp_pda_rejected() {
         data: encode_init_market(&admin.pubkey(), &mint, &pyth_index, &pyth_collateral, 100, 500, 100),
     };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
-    tx.sign(&[&payer, &admin], recent_hash);
+    tx.sign(&[&payer, &admin], banks.get_latest_blockhash().await.unwrap());
     banks.process_transaction(tx).await.unwrap();
 
     let ix = Instruction {
@@ -282,8 +290,8 @@ async fn integration_trade_cpi_wrong_lp_pda_rejected() {
 
     let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
     let engine = zc::engine_ref(&slab_acc.data).unwrap();
-    let user_idx = (0..64).find(|&i| engine.is_used(i) && engine.accounts[i].owner == user.pubkey().to_bytes()).unwrap() as u16;
-    let lp_idx = (0..64).find(|&i| engine.is_used(i) && engine.accounts[i].owner == lp.pubkey().to_bytes()).unwrap() as u16;
+    let user_idx = (0..MAX_ACCOUNTS).find(|&i| engine.is_used(i) && engine.accounts[i].owner == user.pubkey().to_bytes()).unwrap() as u16;
+    let lp_idx = (0..MAX_ACCOUNTS).find(|&i| engine.is_used(i) && engine.accounts[i].owner == lp.pubkey().to_bytes()).unwrap() as u16;
 
     let wrong_lp_pda = Pubkey::new_unique();
     let ix = Instruction {
@@ -293,8 +301,8 @@ async fn integration_trade_cpi_wrong_lp_pda_rejected() {
     };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
     tx.sign(&[&payer, &user, &lp], banks.get_latest_blockhash().await.unwrap());
-    let res = banks.process_transaction(tx).await;
-    assert!(res.is_err());
+    let err = banks.process_transaction(tx).await.unwrap_err();
+    assert!(format!("{err:?}").contains(&format!("Custom({})", percolator_prog::error::PercolatorError::EngineUnauthorized as u32)));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -312,13 +320,18 @@ async fn integration_trade_cpi_wrong_oracle_rejected() {
     let pyth_index = Pubkey::new_unique();
     let pyth_collateral = Pubkey::new_unique();
     let matcher_ctx = Keypair::new();
-    let (vault_auth, _) = Pubkey::find_program_address(&[b"vault", slab.pubkey().as_ref()], &percolator_id);
-    let vault = Pubkey::new_unique();
     let user_ata = Pubkey::new_unique();
     let lp_ata = Pubkey::new_unique();
+    let vault = Pubkey::new_unique();
     let dummy_ata = Pubkey::new_unique();
 
     pt.add_account(slab.pubkey(), Account { lamports: 10_000_000_000, data: vec![0u8; SLAB_LEN], owner: percolator_id, executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
+    pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
+    
+    let (vault_auth, _) = Pubkey::find_program_address(&[b"vault", slab.pubkey().as_ref()], &percolator_id);
     let mut token_data = vec![0u8; spl_token::state::Account::LEN];
     let mut token_state = spl_token::state::Account::default();
     token_state.mint = mint;
@@ -332,12 +345,8 @@ async fn integration_trade_cpi_wrong_oracle_rejected() {
     token_state.owner = lp.pubkey();
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
-    pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
-    let (mut banks, payer, recent_hash) = pt.start().await;
+    let (mut banks, payer, _recent_hash) = pt.start().await;
 
     let ix = Instruction {
         program_id: percolator_id,
@@ -345,7 +354,7 @@ async fn integration_trade_cpi_wrong_oracle_rejected() {
         data: encode_init_market(&admin.pubkey(), &mint, &pyth_index, &pyth_collateral, 100, 500, 100),
     };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
-    tx.sign(&[&payer, &admin], recent_hash);
+    tx.sign(&[&payer, &admin], banks.get_latest_blockhash().await.unwrap());
     banks.process_transaction(tx).await.unwrap();
 
     let ix = Instruction {
@@ -368,10 +377,11 @@ async fn integration_trade_cpi_wrong_oracle_rejected() {
 
     let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
     let engine = zc::engine_ref(&slab_acc.data).unwrap();
-    let user_idx = (0..64).find(|&i| engine.is_used(i) && engine.accounts[i].owner == user.pubkey().to_bytes()).unwrap() as u16;
-    let lp_idx = (0..64).find(|&i| engine.is_used(i) && engine.accounts[i].owner == lp.pubkey().to_bytes()).unwrap() as u16;
+    let user_idx = (0..MAX_ACCOUNTS).find(|&i| engine.is_used(i) && engine.accounts[i].owner == user.pubkey().to_bytes()).unwrap() as u16;
+    let lp_idx = (0..MAX_ACCOUNTS).find(|&i| engine.is_used(i) && engine.accounts[i].owner == lp.pubkey().to_bytes()).unwrap() as u16;
 
     let wrong_oracle = Pubkey::new_unique();
+    // Ensure wrong_oracle exists
     let (lp_pda, _) = Pubkey::find_program_address(&[b"lp", slab.pubkey().as_ref(), &lp_idx.to_le_bytes()], &percolator_id);
     let ix = Instruction {
         program_id: percolator_id,
@@ -380,6 +390,6 @@ async fn integration_trade_cpi_wrong_oracle_rejected() {
     };
     let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
     tx.sign(&[&payer, &user, &lp], banks.get_latest_blockhash().await.unwrap());
-    let res = banks.process_transaction(tx).await;
-    assert!(res.is_err());
+    let err = banks.process_transaction(tx).await.unwrap_err();
+    assert!(format!("{err:?}").contains("InvalidArgument"));
 }
