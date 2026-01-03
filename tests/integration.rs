@@ -205,16 +205,13 @@ async fn integration_trade_cpi_real_trade_success() {
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
 
+    // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
     pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
     pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
-    // Pre-create lp_pda accounts for potential indices (system-owned, 0 data, 0 lamports)
-    for idx in 0u16..4u16 {
-        let (lp_pda_pre, _) = Pubkey::find_program_address(&[b"lp", slab.pubkey().as_ref(), &idx.to_le_bytes()], &percolator_id);
-        pt.add_account(lp_pda_pre, Account { lamports: 0, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
-    }
+    add_lp_pdas(&mut pt, &slab.pubkey(), &percolator_id, 8);
 
     let (mut banks, payer, recent_hash) = pt.start().await;
 
@@ -375,16 +372,13 @@ async fn integration_trade_cpi_wrong_lp_signer_rejected() {
     token_state.owner = lp.pubkey();
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
+    // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
     pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
     pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
-    // Pre-create lp_pda accounts for potential indices
-    for idx in 0u16..4u16 {
-        let (lp_pda_pre, _) = Pubkey::find_program_address(&[b"lp", slab.pubkey().as_ref(), &idx.to_le_bytes()], &percolator_id);
-        pt.add_account(lp_pda_pre, Account { lamports: 0, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
-    }
+    add_lp_pdas(&mut pt, &slab.pubkey(), &percolator_id, 8);
 
     let (mut banks, payer, recent_hash) = pt.start().await;
 
@@ -447,17 +441,14 @@ async fn integration_trade_cpi_wrong_oracle_fails() {
     token_state.owner = lp.pubkey();
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
+    // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
     pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
     pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
     pt.add_account(wrong_oracle, Account { lamports: 1, data: vec![0u8; 208], owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
 
-    // Pre-create lp_pda accounts for potential indices
-    for idx in 0u16..4u16 {
-        let (lp_pda_pre, _) = Pubkey::find_program_address(&[b"lp", slab.pubkey().as_ref(), &idx.to_le_bytes()], &percolator_id);
-        pt.add_account(lp_pda_pre, Account { lamports: 0, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
-    }
+    add_lp_pdas(&mut pt, &slab.pubkey(), &percolator_id, 8);
 
     let (mut banks, payer, recent_hash) = pt.start().await;
 
@@ -540,15 +531,13 @@ async fn integration_nonce_increments() {
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
 
+    // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
     pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
     pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
-    for idx in 0u16..4u16 {
-        let (lp_pda_pre, _) = Pubkey::find_program_address(&[b"lp", slab.pubkey().as_ref(), &idx.to_le_bytes()], &percolator_id);
-        pt.add_account(lp_pda_pre, Account { lamports: 0, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
-    }
+    add_lp_pdas(&mut pt, &slab.pubkey(), &percolator_id, 8);
 
     let (mut banks, payer, recent_hash) = pt.start().await;
 
@@ -634,4 +623,161 @@ async fn integration_nonce_increments() {
     let slab_after2 = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
     let nonce_after2 = u64::from_le_bytes(slab_after2.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
     assert_eq!(nonce_after2, 2, "nonce in slab should be 2 after trade 2");
+}
+
+/// Malicious matcher that returns a replayed (wrong) req_id
+fn malicious_replay_matcher_process_instruction(
+    program_id: &Pubkey,
+    accounts: &[AccountInfo],
+    data: &[u8],
+) -> ProgramResult {
+    if accounts.len() < 2 { return Err(ProgramError::NotEnoughAccountKeys); }
+    let a_lp_pda = &accounts[0];
+    let a_ctx = &accounts[1];
+
+    if !a_lp_pda.is_signer { return Err(ProgramError::MissingRequiredSignature); }
+    if *a_lp_pda.owner != solana_program::system_program::ID { return Err(ProgramError::IllegalOwner); }
+    if a_lp_pda.data_len() != 0 { return Err(ProgramError::InvalidAccountData); }
+    if a_lp_pda.lamports() != 0 { return Err(ProgramError::InvalidAccountData); }
+    if !a_ctx.is_writable { return Err(ProgramError::InvalidAccountData); }
+    if a_ctx.owner != program_id { return Err(ProgramError::IllegalOwner); }
+    if a_ctx.data_len() < MATCHER_CONTEXT_LEN { return Err(ProgramError::InvalidAccountData); }
+
+    if data.len() != MATCHER_CALL_LEN { return Err(ProgramError::InvalidInstructionData); }
+    if data[0] != MATCHER_CALL_TAG { return Err(ProgramError::InvalidInstructionData); }
+
+    let _req_id = u64::from_le_bytes(data[CALL_OFF_REQ_ID..CALL_OFF_REQ_ID+8].try_into().unwrap());
+    let lp_account_id = u64::from_le_bytes(data[CALL_OFF_LP_ACCOUNT_ID..CALL_OFF_LP_ACCOUNT_ID+8].try_into().unwrap());
+    let oracle_price_e6 = u64::from_le_bytes(data[CALL_OFF_ORACLE_PRICE..CALL_OFF_ORACLE_PRICE+8].try_into().unwrap());
+    let req_size = i128::from_le_bytes(data[CALL_OFF_REQ_SIZE..CALL_OFF_REQ_SIZE+16].try_into().unwrap());
+
+    // MALICIOUS: return req_id = 0 instead of echoing the actual req_id
+    let bad_req_id = 0u64;
+
+    {
+        let mut ctx = a_ctx.try_borrow_mut_data()?;
+        ctx[0..64].fill(0);
+
+        ctx[RET_OFF_ABI_VERSION..RET_OFF_ABI_VERSION+4].copy_from_slice(&MATCHER_ABI_VERSION.to_le_bytes());
+        ctx[RET_OFF_FLAGS..RET_OFF_FLAGS+4].copy_from_slice(&1u32.to_le_bytes()); // VALID
+        ctx[RET_OFF_EXEC_PRICE..RET_OFF_EXEC_PRICE+8].copy_from_slice(&oracle_price_e6.to_le_bytes());
+        ctx[RET_OFF_EXEC_SIZE..RET_OFF_EXEC_SIZE+16].copy_from_slice(&req_size.to_le_bytes());
+        ctx[RET_OFF_REQ_ID..RET_OFF_REQ_ID+8].copy_from_slice(&bad_req_id.to_le_bytes()); // WRONG!
+        ctx[RET_OFF_LP_ACCOUNT_ID..RET_OFF_LP_ACCOUNT_ID+8].copy_from_slice(&lp_account_id.to_le_bytes());
+        ctx[RET_OFF_ORACLE_PRICE..RET_OFF_ORACLE_PRICE+8].copy_from_slice(&oracle_price_e6.to_le_bytes());
+        ctx[RET_OFF_RESERVED..RET_OFF_RESERVED+8].copy_from_slice(&0u64.to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Test: Malicious matcher returns wrong req_id → trade fails, nonce does not advance
+#[tokio::test]
+async fn integration_replay_req_id_rejected() {
+    let percolator_id = PERCOLATOR_ID;
+    let malicious_matcher_id = Pubkey::new_unique();
+    let mut pt = ProgramTest::new("percolator_prog", percolator_id, processor!(percolator_processor::process_instruction));
+    pt.add_program("malicious_matcher", malicious_matcher_id, processor!(malicious_replay_matcher_process_instruction));
+
+    let admin = Keypair::new();
+    let user = Keypair::new();
+    let lp = Keypair::new();
+    let slab = Keypair::new();
+    let mint = Pubkey::new_unique();
+    let pyth_index = Pubkey::new_unique();
+    let pyth_collateral = Pubkey::new_unique();
+    let malicious_ctx = Keypair::new();
+    let vault = Pubkey::new_unique();
+    let user_ata = Pubkey::new_unique();
+    let lp_ata = Pubkey::new_unique();
+    let dummy_ata = Pubkey::new_unique();
+
+    pt.add_account(slab.pubkey(), Account { lamports: 10_000_000_000, data: vec![0u8; SLAB_LEN], owner: percolator_id, executable: false, rent_epoch: 0 });
+
+    let mut token_data = vec![0u8; spl_token::state::Account::LEN];
+    let mut token_state = spl_token::state::Account::default();
+    token_state.mint = mint;
+    token_state.owner = vault_auth(&slab.pubkey(), &percolator_id);
+    token_state.state = spl_token::state::AccountState::Initialized;
+    spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
+    pt.add_account(vault, Account { lamports: 1_000_000_000, data: token_data.clone(), owner: spl_token::ID, executable: false, rent_epoch: 0 });
+
+    token_state.owner = user.pubkey();
+    token_state.amount = 3000;
+    spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
+    pt.add_account(user_ata, Account { lamports: 1_000_000_000, data: token_data.clone(), owner: spl_token::ID, executable: false, rent_epoch: 0 });
+
+    token_state.owner = lp.pubkey();
+    token_state.amount = 1000;
+    spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
+    pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
+
+    // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(malicious_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: malicious_matcher_id, executable: false, rent_epoch: 0 });
+    pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
+
+    add_lp_pdas(&mut pt, &slab.pubkey(), &percolator_id, 8);
+
+    let (mut banks, payer, recent_hash) = pt.start().await;
+
+    // Init market
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(mint, false), AccountMeta::new(vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(dummy_ata, false), AccountMeta::new_readonly(solana_sdk::system_program::ID, false), AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false), AccountMeta::new_readonly(pyth_index, false), AccountMeta::new_readonly(pyth_collateral, false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false)], data: encode_init_market(&admin.pubkey(), &mint, &pyth_index, &pyth_collateral, u64::MAX, 500, 100) };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &admin], recent_hash); banks.process_transaction(tx).await.unwrap();
+
+    // Init user
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new(user_ata, false), AccountMeta::new(vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_collateral, false)], data: encode_init_user(0) };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
+
+    let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+    let engine = zc::engine_ref(&slab_acc.data).unwrap();
+    let user_idx = (0..MAX_ACCOUNTS).find(|&i| engine.is_used(i) && engine.accounts[i].owner == user.pubkey().to_bytes()).unwrap() as u16;
+
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new(user_ata, false), AccountMeta::new(vault, false), AccountMeta::new_readonly(spl_token::ID, false)], data: encode_deposit(user_idx, 1000) };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
+
+    // Init LP with malicious matcher
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new(lp_ata, false), AccountMeta::new(vault, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_collateral, false)], data: encode_init_lp(&malicious_matcher_id, &malicious_ctx.pubkey(), 0) };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &lp], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
+
+    let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+    let engine = zc::engine_ref(&slab_acc.data).unwrap();
+    let lp_idx = (0..MAX_ACCOUNTS).find(|&i| engine.is_used(i) && engine.accounts[i].owner == lp.pubkey().to_bytes()).unwrap() as u16;
+
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new(lp_ata, false), AccountMeta::new(vault, false), AccountMeta::new_readonly(spl_token::ID, false)], data: encode_deposit(lp_idx, 1000) };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &lp], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
+
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new(user_ata, false), AccountMeta::new(vault, false), AccountMeta::new_readonly(spl_token::ID, false)], data: encode_top_up_insurance(100) };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
+
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(user_idx, 0, 0) };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
+
+    let ix = Instruction { program_id: percolator_id, accounts: vec![AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false)], data: encode_crank(lp_idx, 0, 0) };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey())); tx.sign(&[&payer, &lp], banks.get_latest_blockhash().await.unwrap()); banks.process_transaction(tx).await.unwrap();
+
+    // Record nonce before failed trade
+    use percolator_prog::state::RESERVED_OFF;
+    let slab_before = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+    let nonce_before = u64::from_le_bytes(slab_before.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
+    assert_eq!(nonce_before, 0, "nonce should be 0 before any trade");
+
+    // Attempt trade with malicious matcher → should fail
+    let (lp_pda, _) = Pubkey::find_program_address(&[b"lp", slab.pubkey().as_ref(), &lp_idx.to_le_bytes()], &percolator_id);
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![AccountMeta::new(user.pubkey(), true), AccountMeta::new(lp.pubkey(), true), AccountMeta::new(slab.pubkey(), false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false), AccountMeta::new_readonly(pyth_index, false), AccountMeta::new_readonly(malicious_matcher_id, false), AccountMeta::new(malicious_ctx.pubkey(), false), AccountMeta::new_readonly(lp_pda, false)],
+        data: encode_trade_cpi(lp_idx, user_idx, 50),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &user, &lp], banks.get_latest_blockhash().await.unwrap());
+    let err = banks.process_transaction(tx).await.unwrap_err();
+
+    // Should fail with InvalidAccountData (bad req_id echo)
+    assert!(format!("{err:?}").contains("InvalidAccountData"), "Expected InvalidAccountData, got: {err:?}");
+
+    // Verify nonce did NOT advance
+    let slab_after = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+    let nonce_after = u64::from_le_bytes(slab_after.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
+    assert_eq!(nonce_after, 0, "nonce should still be 0 after failed trade");
 }
