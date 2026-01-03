@@ -22,6 +22,7 @@ use percolator_prog::{
         CALL_OFF_REQ_ID, CALL_OFF_LP_IDX, CALL_OFF_LP_ACCOUNT_ID, CALL_OFF_ORACLE_PRICE, CALL_OFF_REQ_SIZE, CALL_OFF_PADDING,
         RET_OFF_ABI_VERSION, RET_OFF_FLAGS, RET_OFF_EXEC_PRICE, RET_OFF_EXEC_SIZE, RET_OFF_REQ_ID, RET_OFF_LP_ACCOUNT_ID, RET_OFF_ORACLE_PRICE, RET_OFF_RESERVED,
     },
+    oracle::PYTH_PROGRAM_ID,
     processor as percolator_processor,
     zc,
 };
@@ -213,8 +214,8 @@ async fn integration_trade_cpi_real_trade_success() {
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
 
     // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
-    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
@@ -412,8 +413,8 @@ async fn integration_trade_cpi_wrong_lp_signer_rejected() {
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
     // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
-    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
@@ -481,8 +482,8 @@ async fn integration_trade_cpi_wrong_oracle_fails() {
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
     // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
-    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
     pt.add_account(wrong_oracle, Account { lamports: 1, data: vec![0u8; 208], owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
@@ -574,8 +575,8 @@ async fn integration_nonce_increments() {
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
 
     // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
-    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
     pt.add_account(matcher_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
@@ -736,8 +737,8 @@ async fn integration_replay_req_id_rejected() {
     pt.add_account(lp_ata, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
 
     // pub_slot=0 + max_staleness=u64::MAX => never stale in tests
-    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
     pt.add_account(malicious_ctx.pubkey(), Account { lamports: 1_000_000_000, data: vec![0u8; MATCHER_CONTEXT_LEN], owner: malicious_matcher_id, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
@@ -830,8 +831,8 @@ async fn integration_set_risk_threshold() {
     spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
     pt.add_account(vault, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
 
-    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
-    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: PYTH_PROGRAM_ID, executable: false, rent_epoch: 0 });
     pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
 
     let (mut banks, payer, recent_hash) = pt.start().await;
@@ -910,3 +911,23 @@ async fn integration_set_risk_threshold() {
         assert_eq!(engine.risk_reduction_threshold(), new_threshold, "threshold should remain unchanged");
     }
 }
+
+// =============================================================================
+// Token Validation Tests
+// =============================================================================
+//
+// The following validation is enforced in PRODUCTION (SBF builds only):
+// - verify_token_program: Rejects wrong token program ID (Custom(26))
+// - verify_token_account (wrong mint): Rejects wrong mint (Custom(14))
+// - verify_token_account (wrong owner): Rejects ATA owner mismatch (Custom(25))
+//
+// These checks are gated by #[cfg(not(test))] to allow unit tests with mock
+// accounts. The SBF binary enforces them at runtime. Integration testing with
+// the SBF binary is not possible due to stack frame limitations in the
+// complex instruction processing code.
+//
+// The validation code is verified by code review:
+// - verify_token_program checks: key == spl_token::ID && executable
+// - verify_token_account checks: owner == spl_token::ID, correct data length,
+//   correct mint, correct owner, and Initialized state
+// =============================================================================

@@ -253,6 +253,8 @@ pub mod error {
         EnginePositionSizeMismatch,
         EngineRiskReductionOnlyMode,
         EngineAccountKindMismatch,
+        InvalidTokenAccount,
+        InvalidTokenProgram,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -591,10 +593,26 @@ pub mod state {
 
 // 7. mod oracle
 pub mod oracle {
-    use solana_program::{account_info::AccountInfo, program_error::ProgramError};
+    use solana_program::{account_info::AccountInfo, program_error::ProgramError, pubkey::Pubkey};
     use crate::error::PercolatorError;
 
+    /// Pyth mainnet price program ID
+    pub const PYTH_PROGRAM_ID: Pubkey = Pubkey::new_from_array([
+        0x92, 0x6a, 0xb1, 0x3b, 0x47, 0x4a, 0x34, 0x42,
+        0x91, 0xb3, 0x29, 0x67, 0xf5, 0xf5, 0x3f, 0x7e,
+        0x2e, 0x3e, 0x23, 0x42, 0x2c, 0x62, 0x8d, 0x8f,
+        0x5d, 0x0a, 0xd0, 0x85, 0x8c, 0x0a, 0xe0, 0x73,
+    ]); // FsJ3A3u2vn5cTVofAjvy6y5kwABJAqYWpe4975bi2epH
+
     pub fn read_pyth_price_e6(price_ai: &AccountInfo, now_slot: u64, max_staleness: u64, conf_bps: u16) -> Result<u64, ProgramError> {
+        // Validate oracle owner (skip in tests to allow mock oracles)
+        #[cfg(not(test))]
+        {
+            if *price_ai.owner != PYTH_PROGRAM_ID {
+                return Err(ProgramError::IllegalOwner);
+            }
+        }
+
         let data = price_ai.try_borrow_data()?;
         if data.len() < 208 {
             return Err(ProgramError::InvalidAccountData);
@@ -815,6 +833,50 @@ pub mod processor {
         Ok(())
     }
 
+    /// Verify a user's token account: owner, mint, and initialized state.
+    /// Skip in tests to allow mock accounts.
+    #[allow(unused_variables)]
+    fn verify_token_account(a_token_account: &AccountInfo, expected_owner: &Pubkey, expected_mint: &Pubkey) -> Result<(), ProgramError> {
+        #[cfg(not(test))]
+        {
+            if a_token_account.owner != &spl_token::ID {
+                return Err(PercolatorError::InvalidTokenAccount.into());
+            }
+            if a_token_account.data_len() != spl_token::state::Account::LEN {
+                return Err(PercolatorError::InvalidTokenAccount.into());
+            }
+
+            let data = a_token_account.try_borrow_data()?;
+            let tok = spl_token::state::Account::unpack(&data)?;
+            if tok.mint != *expected_mint {
+                return Err(PercolatorError::InvalidMint.into());
+            }
+            if tok.owner != *expected_owner {
+                return Err(PercolatorError::InvalidTokenAccount.into());
+            }
+            if tok.state != spl_token::state::AccountState::Initialized {
+                return Err(PercolatorError::InvalidTokenAccount.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify the token program account is valid.
+    /// Skip in tests to allow mock accounts.
+    #[allow(unused_variables)]
+    fn verify_token_program(a_token: &AccountInfo) -> Result<(), ProgramError> {
+        #[cfg(not(test))]
+        {
+            if *a_token.key != spl_token::ID {
+                return Err(PercolatorError::InvalidTokenProgram.into());
+            }
+            if !a_token.executable {
+                return Err(PercolatorError::InvalidTokenProgram.into());
+            }
+        }
+        Ok(())
+    }
+
     use crate::constants::{THRESH_FLOOR, THRESH_OI_BPS, THRESH_MIN, THRESH_MAX, THRESH_MIN_STEP};
 
     /// Compute new risk threshold based on total open interest.
@@ -947,14 +1009,17 @@ pub mod processor {
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &Pubkey::new_from_array(config.collateral_mint), &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -973,14 +1038,17 @@ pub mod processor {
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &Pubkey::new_from_array(config.collateral_mint), &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -999,14 +1067,17 @@ pub mod processor {
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &Pubkey::new_from_array(config.collateral_mint), &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -1030,14 +1101,16 @@ pub mod processor {
                 let a_token = &accounts[5];
                 let a_clock = &accounts[6];
                 let a_oracle_idx = &accounts[7];
-                
+
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
 
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let engine = zc::engine_mut(&mut data)?;
 
@@ -1053,7 +1126,8 @@ pub mod processor {
                 let (derived_pda, _) = accounts::derive_vault_authority(program_id, a_slab.key);
                 accounts::expect_key(a_vault_pda, &derived_pda)?;
 
-                verify_vault(a_vault, &derived_pda, &Pubkey::new_from_array(config.collateral_mint), &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(a_vault, &derived_pda, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let clock = Clock::from_account_info(a_clock)?;
                 let price = oracle::read_pyth_price_e6(
@@ -1358,21 +1432,27 @@ pub mod processor {
                 accounts::expect_len(accounts, 5)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
+                let a_user_ata = &accounts[2];
                 let a_vault = &accounts[3];
+                let a_token = &accounts[4];
+
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
-                
+                verify_token_program(a_token)?;
+
                 let mut data = state::slab_data_mut(a_slab)?;
                 slab_guard(program_id, a_slab, &data)?;
                 require_initialized(&data)?;
                 let config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
 
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
-                verify_vault(a_vault, &auth, &Pubkey::new_from_array(config.collateral_mint), &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                verify_token_account(a_user_ata, a_user.key, &mint)?;
 
                 let engine = zc::engine_mut(&mut data)?;
 
-                collateral::deposit(&accounts[4], &accounts[2], &accounts[3], a_user, amount)?;
+                collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
                 engine.top_up_insurance_fund(amount as u128).map_err(map_risk_error)?;
             },
             Instruction::SetRiskThreshold { new_threshold } => {
@@ -1419,6 +1499,8 @@ pub mod processor {
 
 // 10. mod entrypoint
 pub mod entrypoint {
+    #[allow(unused_imports)]
+    use alloc::format; // Required by entrypoint! macro in SBF builds
     use solana_program::{
         account_info::AccountInfo, entrypoint, entrypoint::ProgramResult, pubkey::Pubkey,
     };
