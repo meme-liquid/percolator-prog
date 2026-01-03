@@ -165,6 +165,12 @@ fn encode_top_up_insurance(amount: u64) -> Vec<u8> {
     v
 }
 
+fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
+    let mut v = vec![11u8];
+    v.extend_from_slice(&new_threshold.to_le_bytes());
+    v
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn integration_trade_cpi_real_trade_success() {
     let percolator_id = PERCOLATOR_ID;
@@ -335,6 +341,38 @@ async fn integration_trade_cpi_real_trade_success() {
     use percolator_prog::state::RESERVED_OFF;
     let nonce_in_header = u64::from_le_bytes(slab_acc.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
     assert_eq!(nonce_in_header, 1, "Nonce in slab header should be 1 after first trade");
+
+    // Verify total_open_interest is non-zero after trade
+    assert!(engine.total_open_interest > 0, "OI should be non-zero after trade");
+
+    // 7. Call crank to trigger threshold auto-update
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),    // caller (signer)
+            AccountMeta::new(slab.pubkey(), false),   // slab (writable)
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            AccountMeta::new_readonly(pyth_collateral, false),
+        ],
+        data: encode_crank(user_idx, 0, 0),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &user], banks.get_latest_blockhash().await.unwrap());
+    banks.process_transaction(tx).await.unwrap();
+
+    // 8. Verify threshold was updated based on OI
+    let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+    let engine = zc::engine_ref(&slab_acc.data).unwrap();
+    let oi_after = engine.total_open_interest;
+
+    // Calculate expected threshold: THRESH_FLOOR + (oi_notional * THRESH_OI_BPS / 10000)
+    // Oracle price = 1_000_000 (from make_pyth(1_000_000, -6, ...)), so price_e6 = 1_000_000
+    // oi_notional = oi_after * 1_000_000 / 1_000_000 = oi_after
+    // variable = oi_after * 50 / 10_000
+    let expected_threshold = oi_after * 50 / 10_000;
+    let actual_threshold = engine.risk_reduction_threshold();
+
+    assert_eq!(actual_threshold, expected_threshold, "Threshold should match formula after crank");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -804,4 +842,108 @@ async fn integration_replay_req_id_rejected() {
     let slab_after2 = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
     let nonce_after2 = u64::from_le_bytes(slab_after2.data[RESERVED_OFF..RESERVED_OFF+8].try_into().unwrap());
     assert_eq!(nonce_after2, 1, "nonce should remain 1 after failed replay trade");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn integration_set_risk_threshold() {
+    let percolator_id = PERCOLATOR_ID;
+    let mut pt = ProgramTest::new("percolator_prog", percolator_id, processor!(percolator_processor::process_instruction));
+
+    let admin = Keypair::new();
+    let slab = Keypair::new();
+    let mint = Pubkey::new_unique();
+    let pyth_index = Pubkey::new_unique();
+    let pyth_collateral = Pubkey::new_unique();
+    let vault = Pubkey::new_unique();
+    let dummy_ata = Pubkey::new_unique();
+
+    pt.add_account(slab.pubkey(), Account { lamports: 10_000_000_000, data: vec![0u8; SLAB_LEN], owner: percolator_id, executable: false, rent_epoch: 0 });
+
+    let mut token_data = vec![0u8; spl_token::state::Account::LEN];
+    let mut token_state = spl_token::state::Account::default();
+    token_state.mint = mint;
+    token_state.owner = vault_auth(&slab.pubkey(), &percolator_id);
+    token_state.state = spl_token::state::AccountState::Initialized;
+    spl_token::state::Account::pack(token_state, &mut token_data).unwrap();
+    pt.add_account(vault, Account { lamports: 1_000_000_000, data: token_data, owner: spl_token::ID, executable: false, rent_epoch: 0 });
+
+    pt.add_account(pyth_index, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(pyth_collateral, Account { lamports: 1_000_000_000, data: make_pyth(1_000_000, -6, 1, 0), owner: Pubkey::new_unique(), executable: false, rent_epoch: 0 });
+    pt.add_account(dummy_ata, Account { lamports: 1_000_000, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 });
+
+    let (mut banks, payer, recent_hash) = pt.start().await;
+
+    // 1. Init Market
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(slab.pubkey(), false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::rent::ID, false),
+            AccountMeta::new_readonly(pyth_index, false),
+            AccountMeta::new_readonly(pyth_collateral, false),
+            AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+        ],
+        data: encode_init_market(&admin.pubkey(), &mint, &pyth_index, &pyth_collateral, u64::MAX, 500, 100),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &admin], recent_hash);
+    banks.process_transaction(tx).await.unwrap();
+
+    // Verify initial threshold is 0
+    {
+        let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+        let engine = zc::engine_ref(&slab_acc.data).unwrap();
+        assert_eq!(engine.risk_reduction_threshold(), 0, "initial threshold should be 0");
+    }
+
+    // 2. Admin sets new threshold
+    let new_threshold: u128 = 123_456_789_000;
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true), // admin (signer)
+            AccountMeta::new(slab.pubkey(), false), // slab (writable)
+        ],
+        data: encode_set_risk_threshold(new_threshold),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &admin], banks.get_latest_blockhash().await.unwrap());
+    banks.process_transaction(tx).await.unwrap();
+
+    // Verify threshold was updated
+    {
+        let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+        let engine = zc::engine_ref(&slab_acc.data).unwrap();
+        assert_eq!(engine.risk_reduction_threshold(), new_threshold, "threshold should be updated");
+    }
+
+    // 3. Non-admin tries to set threshold - should fail
+    let attacker = Keypair::new();
+    let ix = Instruction {
+        program_id: percolator_id,
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true), // attacker (signer, but not admin)
+            AccountMeta::new(slab.pubkey(), false),    // slab (writable)
+        ],
+        data: encode_set_risk_threshold(999_999),
+    };
+    let mut tx = Transaction::new_with_payer(&[ix], Some(&payer.pubkey()));
+    tx.sign(&[&payer, &attacker], banks.get_latest_blockhash().await.unwrap());
+    let err = banks.process_transaction(tx).await.unwrap_err();
+
+    // Should fail with Custom(15) = EngineUnauthorized
+    assert!(format!("{err:?}").contains("Custom(15)"), "Expected EngineUnauthorized error, got: {err:?}");
+
+    // Verify threshold was NOT changed (still at new_threshold)
+    {
+        let slab_acc = banks.get_account(slab.pubkey()).await.unwrap().unwrap();
+        let engine = zc::engine_ref(&slab_acc.data).unwrap();
+        assert_eq!(engine.risk_reduction_threshold(), new_threshold, "threshold should remain unchanged");
+    }
 }

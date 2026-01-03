@@ -61,6 +61,18 @@ pub mod constants {
     pub const RET_OFF_LP_ACCOUNT_ID: usize = 40;
     pub const RET_OFF_ORACLE_PRICE: usize = 48;
     pub const RET_OFF_RESERVED: usize = 56;
+
+    // Auto-threshold policy constants
+    /// Base floor for risk_reduction_threshold (can be 0 for demo)
+    pub const THRESH_FLOOR: u128 = 0;
+    /// Basis points of OI notional to add to floor (50 = 0.50%)
+    pub const THRESH_OI_BPS: u64 = 50;
+    /// Minimum threshold value
+    pub const THRESH_MIN: u128 = 0;
+    /// Maximum threshold value (cap to prevent overflow)
+    pub const THRESH_MAX: u128 = 10_000_000_000_000_000_000u128;
+    /// Minimum step size to avoid churn on tiny changes
+    pub const THRESH_MIN_STEP: u128 = 1;
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -293,6 +305,7 @@ pub mod ix {
         CloseAccount { user_idx: u16 },
         TopUpInsurance { amount: u64 },
         TradeCpi { lp_idx: u16, user_idx: u16, size: i128 },
+        SetRiskThreshold { new_threshold: u128 },
     }
 
     impl Instruction {
@@ -362,6 +375,10 @@ pub mod ix {
                     let user_idx = read_u16(&mut rest)?;
                     let size = read_i128(&mut rest)?;
                     Ok(Instruction::TradeCpi { lp_idx, user_idx, size })
+                },
+                11 => { // SetRiskThreshold
+                    let new_threshold = read_u128(&mut rest)?;
+                    Ok(Instruction::SetRiskThreshold { new_threshold })
                 },
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -772,12 +789,61 @@ pub mod processor {
         if a_vault.key != expected_pubkey { return Err(PercolatorError::InvalidVaultAta.into()); }
         if a_vault.owner != &spl_token::ID { return Err(PercolatorError::InvalidVaultAta.into()); }
         if a_vault.data_len() != spl_token::state::Account::LEN { return Err(PercolatorError::InvalidVaultAta.into()); }
-        
+
         let data = a_vault.try_borrow_data()?;
         let tok = spl_token::state::Account::unpack(&data)?;
         if tok.mint != *expected_mint { return Err(PercolatorError::InvalidMint.into()); }
         if tok.owner != *expected_owner { return Err(PercolatorError::InvalidVaultAta.into()); }
         Ok(())
+    }
+
+    use crate::constants::{THRESH_FLOOR, THRESH_OI_BPS, THRESH_MIN, THRESH_MAX, THRESH_MIN_STEP};
+
+    /// Compute new risk threshold based on total open interest.
+    /// Formula: threshold = FLOOR + (OI_notional * THRESH_OI_BPS / 10000)
+    /// where OI_notional = total_open_interest * oracle_price_e6 / 1_000_000
+    ///
+    /// Hysteresis: only updates if change >= max(THRESH_MIN_STEP, old_threshold / 100)
+    /// Returns: new threshold to set, or old threshold if change is too small
+    fn compute_auto_threshold(old: u128, total_oi: u128, price_e6: u64) -> u128 {
+        // Compute OI notional: total_oi * price / 1e6
+        let oi_notional = total_oi
+            .saturating_mul(price_e6 as u128)
+            .checked_div(1_000_000)
+            .unwrap_or(0);
+
+        // Variable component: oi_notional * THRESH_OI_BPS / 10000
+        let variable = oi_notional
+            .saturating_mul(THRESH_OI_BPS as u128)
+            .checked_div(10_000)
+            .unwrap_or(0);
+
+        // New threshold = floor + variable
+        let mut new_threshold = THRESH_FLOOR.saturating_add(variable);
+
+        // Clamp to [THRESH_MIN, THRESH_MAX]
+        if new_threshold < THRESH_MIN {
+            new_threshold = THRESH_MIN;
+        }
+        if new_threshold > THRESH_MAX {
+            new_threshold = THRESH_MAX;
+        }
+
+        // Hysteresis: only update if change is significant
+        // Threshold: max(THRESH_MIN_STEP, old / 100)
+        let hysteresis_threshold = core::cmp::max(THRESH_MIN_STEP, old / 100);
+        let abs_diff = if new_threshold > old {
+            new_threshold - old
+        } else {
+            old - new_threshold
+        };
+
+        if abs_diff < hysteresis_threshold {
+            // Change too small, keep old value
+            old
+        } else {
+            new_threshold
+        }
     }
 
     pub fn process_instruction<'a, 'b>(
@@ -1023,7 +1089,15 @@ pub mod processor {
                 let clock = Clock::from_account_info(a_clock)?;
                 let price = oracle::read_pyth_price_e6(a_oracle, clock.slot, config.max_staleness_slots, config.conf_filter_bps)?;
 
+                // Capture old threshold before crank
+                let old_thr = engine.risk_reduction_threshold();
+
+                // Execute crank
                 let _outcome = engine.keeper_crank(caller_idx, clock.slot, price, funding_rate_bps_per_slot, allow_panic != 0).map_err(map_risk_error)?;
+
+                // After successful crank, update threshold based on total open interest
+                let new_thr = compute_auto_threshold(old_thr, engine.total_open_interest, price);
+                engine.set_risk_reduction_threshold(new_thr);
             },
             Instruction::TradeNoCpi { lp_idx, user_idx, size } => {
                 accounts::expect_len(accounts, 5)?;
@@ -1277,6 +1351,26 @@ pub mod processor {
 
                 collateral::deposit(&accounts[4], &accounts[2], &accounts[3], a_user, amount)?;
                 engine.top_up_insurance_fund(amount as u128).map_err(map_risk_error)?;
+            },
+            Instruction::SetRiskThreshold { new_threshold } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                if header.admin != a_admin.key.to_bytes() {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                let engine = zc::engine_mut(&mut data)?;
+                engine.set_risk_reduction_threshold(new_threshold);
             }
         }
         Ok(())
@@ -1509,6 +1603,12 @@ mod tests {
         encode_u16(lp, &mut data);
         encode_u16(user, &mut data);
         encode_i128(size, &mut data);
+        data
+    }
+
+    fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
+        let mut data = vec![11u8];
+        encode_u128(new_threshold, &mut data);
         data
     }
 
@@ -2006,5 +2106,188 @@ mod tests {
             process_instruction(&f.program_id, &accs, &encode_trade_cpi(lp_idx, user_idx, 100))
         };
         assert_eq!(res, Err(ProgramError::InvalidArgument));
+    }
+
+    #[test]
+    fn test_set_risk_threshold() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        // Verify initial threshold is 0
+        {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            assert_eq!(engine.risk_reduction_threshold(), 0);
+        }
+
+        // Admin sets new threshold
+        let new_threshold: u128 = 123_456_789;
+        {
+            let accs = vec![
+                f.admin.to_info(), // admin (signer)
+                f.slab.to_info(),  // slab (writable)
+            ];
+            process_instruction(&f.program_id, &accs, &encode_set_risk_threshold(new_threshold)).unwrap();
+        }
+
+        // Verify threshold was updated
+        {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            assert_eq!(engine.risk_reduction_threshold(), new_threshold);
+        }
+    }
+
+    #[test]
+    fn test_set_risk_threshold_non_admin_fails() {
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        // Non-admin tries to set threshold
+        let mut attacker = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let new_threshold: u128 = 999_999;
+        {
+            let accs = vec![
+                attacker.to_info(), // attacker (signer, but not admin)
+                f.slab.to_info(),   // slab (writable)
+            ];
+            let res = process_instruction(&f.program_id, &accs, &encode_set_risk_threshold(new_threshold));
+            assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+        }
+
+        // Verify threshold was NOT updated (still 0)
+        {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            assert_eq!(engine.risk_reduction_threshold(), 0);
+        }
+    }
+
+    #[test]
+    fn test_crank_updates_threshold_from_open_interest() {
+        use crate::constants::{THRESH_FLOOR, THRESH_OI_BPS};
+
+        let mut f = setup_market();
+        let init_data = encode_init_market(&f, 100);
+        {
+            let mut dummy = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accs = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &init_data).unwrap();
+        }
+
+        // Verify initial threshold is 0
+        {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            assert_eq!(engine.risk_reduction_threshold(), 0);
+            assert_eq!(engine.total_open_interest, 0);
+        }
+
+        // Create user
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, user.key, 10_000_000)).writable();
+        {
+            let accs = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                f.clock.to_info(), f.pyth_col.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        // Create LP
+        let mut lp = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut lp_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0, make_token_account(f.mint.key, lp.key, 10_000_000)).writable();
+        let mut d1 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        let mut d2 = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+        {
+            let matcher_prog_key = d1.key;
+            let matcher_ctx_key = d2.key;
+            let accs = vec![
+                lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                d1.to_info(), d2.to_info(),
+            ];
+            process_instruction(&f.program_id, &accs, &encode_init_lp(matcher_prog_key, matcher_ctx_key, 0)).unwrap();
+        }
+        let lp_idx = find_idx_by_owner(&f.slab.data, lp.key).unwrap();
+
+        // Deposit for both user and LP
+        {
+            let accs = vec![user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            process_instruction(&f.program_id, &accs, &encode_deposit(user_idx, 1_000_000)).unwrap();
+        }
+        {
+            let accs = vec![lp.to_info(), f.slab.to_info(), lp_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()];
+            process_instruction(&f.program_id, &accs, &encode_deposit(lp_idx, 1_000_000)).unwrap();
+        }
+
+        // Execute trade to create open interest (following test_trade pattern - no crank before trade)
+        let trade_size: i128 = 100_000;
+        {
+            let accs = vec![
+                user.to_info(), lp.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()
+            ];
+            process_instruction(&f.program_id, &accs, &encode_trade(lp_idx, user_idx, trade_size)).unwrap();
+        }
+
+        // Check OI increased after trade and capture it
+        let total_oi = {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            assert!(engine.total_open_interest > 0, "OI should be non-zero after trade");
+            engine.total_open_interest
+        };
+
+        // Capture threshold before crank
+        let threshold_before = {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            engine.risk_reduction_threshold()
+        };
+        assert_eq!(threshold_before, 0, "Threshold should be 0 before crank");
+
+        // Now call crank - this should update threshold based on OI at crank time
+        {
+            let accs = vec![user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_col.to_info()];
+            process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0, 0)).unwrap();
+        }
+
+        // Verify threshold was updated based on OI
+        {
+            let engine = zc::engine_ref(&f.slab.data).unwrap();
+            let threshold = engine.risk_reduction_threshold();
+            let oi_after = engine.total_open_interest;
+
+            // Calculate expected threshold using OI after crank (crank may liquidate positions)
+            // Oracle price: make_pyth(1000, -6, ...) -> scale = -6+6 = 0 -> price_e6 = 1000
+            let oracle_price_e6: u64 = 1000;
+            let oi_notional = (oi_after * oracle_price_e6 as u128) / 1_000_000;
+            let variable = (oi_notional * THRESH_OI_BPS as u128) / 10_000;
+            let expected = THRESH_FLOOR + variable;
+
+            assert_eq!(threshold, expected, "Threshold should match formula based on OI at crank time");
+
+            // Also verify that for this test scenario, the formula produces expected results:
+            // If OI changed during crank, threshold should reflect that
+            // With total_oi=200000 originally:
+            //   oi_notional = 200000 * 1000 / 1_000_000 = 200
+            //   variable = 200 * 50 / 10_000 = 1
+            //   expected = 0 + 1 = 1
+            // But if OI was cleared by crank (to 0), threshold = 0
+            // Either way, threshold should match the formula with current OI
+        }
     }
 }
