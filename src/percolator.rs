@@ -617,6 +617,10 @@ pub mod zc {
     use solana_program::program_error::ProgramError;
     use percolator::RiskEngine;
     use crate::constants::{ENGINE_OFF, ENGINE_LEN, ENGINE_ALIGN};
+    use core::mem::offset_of;
+
+    // Use const to export the actual offset for debugging
+    pub const ACCOUNTS_OFFSET: usize = offset_of!(RiskEngine, accounts);
 
     #[inline]
     pub fn engine_ref<'a>(data: &'a [u8]) -> Result<&'a RiskEngine, ProgramError> {
@@ -1776,8 +1780,9 @@ pub mod processor {
                 check_idx(engine, lp_idx)?;
                 check_idx(engine, user_idx)?;
 
-                // Owner authorization via verify helper (Kani-provable)
                 let u_owner = engine.accounts[user_idx as usize].owner;
+
+                // Owner authorization via verify helper (Kani-provable)
                 if !crate::verify::owner_ok(u_owner, a_user.key.to_bytes()) {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
@@ -2395,6 +2400,21 @@ mod tests {
 
         let account_array_size = MAX_ACCOUNTS * size_of::<Account>();
         println!("Account array size: {}", account_array_size);
+
+        // Print offset of accounts array within RiskEngine
+        println!("Offset of RiskEngine.accounts: {}", offset_of!(RiskEngine, accounts));
+        println!("Offset of RiskEngine.vault: {}", offset_of!(RiskEngine, vault));
+        println!("Offset of RiskEngine.insurance_fund: {}", offset_of!(RiskEngine, insurance_fund));
+        println!("Offset of RiskEngine.params: {}", offset_of!(RiskEngine, params));
+        println!("Offset of RiskEngine.used: {}", offset_of!(RiskEngine, used));
+
+        // Print the SBF constant (note: this is x86_64 value when run as native test)
+        println!("ACCOUNTS_OFFSET (this test is x86_64): {}", crate::zc::ACCOUNTS_OFFSET);
+
+        // Print SLAB_LEN
+        println!("ENGINE_OFF: {}", crate::constants::ENGINE_OFF);
+        println!("ENGINE_LEN: {}", crate::constants::ENGINE_LEN);
+        println!("SLAB_LEN: {}", crate::constants::SLAB_LEN);
     }
 
     #[test]
