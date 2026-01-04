@@ -1369,13 +1369,14 @@ fn kani_decide_admin_rejects() {
 }
 
 // =============================================================================
-// U. VERIFY::ABI_OK EQUIVALENCE (2 proofs)
-// Prove that verify::abi_ok matches validate_matcher_return semantics
+// U. VERIFY::ABI_OK EQUIVALENCE (1 proof)
+// Prove that verify::abi_ok is equivalent to validate_matcher_return
 // =============================================================================
 
-/// Prove: verify::abi_ok accepts iff validate_matcher_return accepts
+/// Prove: verify::abi_ok returns true iff validate_matcher_return returns Ok
+/// This is a single strong equivalence proof - abi_ok calls the real validator.
 #[kani::proof]
-fn kani_abi_ok_matches_validate_accept() {
+fn kani_abi_ok_equals_validate() {
     let ret = any_matcher_return();
     let lp_account_id: u64 = kani::any();
     let oracle_price: u64 = kani::any();
@@ -1396,39 +1397,9 @@ fn kani_abi_ok_matches_validate_accept() {
     };
     let abi_ok_result = abi_ok(ret_fields, lp_account_id, oracle_price, req_size, req_id);
 
-    // If validate accepts, abi_ok must accept
-    if validate_result.is_ok() {
-        assert!(abi_ok_result, "abi_ok must accept when validate_matcher_return accepts");
-    }
-}
-
-/// Prove: verify::abi_ok rejects iff validate_matcher_return rejects
-#[kani::proof]
-fn kani_abi_ok_matches_validate_reject() {
-    let ret = any_matcher_return();
-    let lp_account_id: u64 = kani::any();
-    let oracle_price: u64 = kani::any();
-    let req_size: i128 = kani::any();
-    let req_id: u64 = kani::any();
-
-    let validate_result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
-
-    let ret_fields = MatcherReturnFields {
-        abi_version: ret.abi_version,
-        flags: ret.flags,
-        exec_price_e6: ret.exec_price_e6,
-        exec_size: ret.exec_size,
-        req_id: ret.req_id,
-        lp_account_id: ret.lp_account_id,
-        oracle_price_e6: ret.oracle_price_e6,
-        reserved: ret.reserved,
-    };
-    let abi_ok_result = abi_ok(ret_fields, lp_account_id, oracle_price, req_size, req_id);
-
-    // If validate rejects, abi_ok must reject
-    if validate_result.is_err() {
-        assert!(!abi_ok_result, "abi_ok must reject when validate_matcher_return rejects");
-    }
+    // Strong equivalence: abi_ok == validate.is_ok() for all inputs
+    assert_eq!(abi_ok_result, validate_result.is_ok(),
+        "abi_ok must be equivalent to validate_matcher_return.is_ok()");
 }
 
 // =============================================================================

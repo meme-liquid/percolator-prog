@@ -4,8 +4,8 @@
 
 **Date:** 2026-01-04
 **Kani Version:** 0.66.0
-**Total Proofs:** 86
-**Passed:** 86
+**Total Proofs:** 85
+**Passed:** 85
 **Failed:** 0
 
 ## Proof Categories
@@ -173,11 +173,10 @@ These subsume all specific nonce proofs with universal quantification.
 | kani_decide_admin_accepts | Valid admin -> accept |
 | kani_decide_admin_rejects | Invalid admin -> reject |
 
-### U. ABI Equivalence (2 proofs) - CRITICAL
+### U. ABI Equivalence (1 proof) - CRITICAL
 | Harness | Property |
 |---------|----------|
-| kani_abi_ok_matches_validate_accept | verify::abi_ok accepts iff validate_matcher_return accepts |
-| kani_abi_ok_matches_validate_reject | verify::abi_ok rejects iff validate_matcher_return rejects |
+| kani_abi_ok_equals_validate | verify::abi_ok == validate_matcher_return.is_ok() for all inputs |
 
 ### V. TradeCpi From Real Inputs (3 proofs) - CRITICAL
 | Harness | Property |
@@ -221,6 +220,7 @@ These subsume all specific nonce proofs with universal quantification.
 1. **All field mismatches rejected** - ABI version, req_id, lp_account_id, oracle_price, reserved
 2. **Flag semantics enforced** - VALID required, REJECTED causes rejection, PARTIAL_OK for zero size
 3. **Size constraints enforced** - exec_size <= req_size, sign must match
+4. **No overflow on i128::MIN** - Uses unsigned_abs() to avoid panic on extreme values
 
 ## Implementation: pub mod verify
 
@@ -260,9 +260,10 @@ pub mod verify {
     pub fn decide_trade_cpi(...) -> TradeCpiDecision
     pub fn decision_nonce(old_nonce, decision) -> u64
 
-    // ABI validation from real inputs (CRITICAL - proves program-level policies)
-    pub struct MatcherReturnFields { abi_version, flags, exec_price_e6, exec_size, req_id, lp_account_id, oracle_price_e6, reserved }
-    pub fn abi_ok(ret: MatcherReturnFields, lp_account_id, oracle_price, req_size, req_id) -> bool
+    // ABI validation from real inputs (CRITICAL - no logic duplication)
+    pub struct MatcherReturnFields { ... }
+    impl MatcherReturnFields { fn to_matcher_return(&self) -> MatcherReturn }
+    pub fn abi_ok(ret, ...) -> bool  // calls validate_matcher_return internally
     pub fn decide_trade_cpi_from_ret(..., ret: MatcherReturnFields, ...) -> TradeCpiDecision
 
     pub enum TradeNoCpiDecision { Reject, Accept }

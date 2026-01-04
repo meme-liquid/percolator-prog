@@ -422,7 +422,7 @@ pub mod verify {
     // =========================================================================
 
     /// Pure matcher return fields for Kani verification.
-    /// Mirrors constants::MatcherReturn but lives in verify module.
+    /// Mirrors matcher_abi::MatcherReturn but lives in verify module for Kani access.
     #[derive(Debug, Clone, Copy)]
     pub struct MatcherReturnFields {
         pub abi_version: u32,
@@ -435,14 +435,26 @@ pub mod verify {
         pub reserved: u64,
     }
 
-    // ABI constants (must match constants module)
-    const MATCHER_ABI_VERSION: u32 = 1;
-    const FLAG_VALID: u32 = 1;
-    const FLAG_PARTIAL_OK: u32 = 2;
-    const FLAG_REJECTED: u32 = 4;
+    impl MatcherReturnFields {
+        /// Convert to matcher_abi::MatcherReturn for validation.
+        #[inline]
+        pub fn to_matcher_return(&self) -> crate::matcher_abi::MatcherReturn {
+            crate::matcher_abi::MatcherReturn {
+                abi_version: self.abi_version,
+                flags: self.flags,
+                exec_price_e6: self.exec_price_e6,
+                exec_size: self.exec_size,
+                req_id: self.req_id,
+                lp_account_id: self.lp_account_id,
+                oracle_price_e6: self.oracle_price_e6,
+                reserved: self.reserved,
+            }
+        }
+    }
 
-    /// Pure ABI validation of matcher return.
+    /// ABI validation of matcher return - calls the real validate_matcher_return.
     /// Returns true iff the matcher return passes all ABI checks.
+    /// This avoids logic duplication and ensures Kani proofs test the real code.
     #[inline]
     pub fn abi_ok(
         ret: MatcherReturnFields,
@@ -451,32 +463,14 @@ pub mod verify {
         req_size: i128,
         expected_req_id: u64,
     ) -> bool {
-        // Check ABI version
-        if ret.abi_version != MATCHER_ABI_VERSION { return false; }
-        // Must have VALID flag set
-        if (ret.flags & FLAG_VALID) == 0 { return false; }
-        // Must not have REJECTED flag set
-        if (ret.flags & FLAG_REJECTED) != 0 { return false; }
-        // Validate echoed fields match request
-        if ret.lp_account_id != expected_lp_account_id { return false; }
-        if ret.oracle_price_e6 != expected_oracle_price_e6 { return false; }
-        if ret.reserved != 0 { return false; }
-        if ret.req_id != expected_req_id { return false; }
-        // Require exec_price_e6 != 0 always
-        if ret.exec_price_e6 == 0 { return false; }
-        // Zero exec_size requires PARTIAL_OK flag
-        if ret.exec_size == 0 {
-            if (ret.flags & FLAG_PARTIAL_OK) == 0 {
-                return false;
-            }
-            return true; // Zero fill with PARTIAL_OK is allowed
-        }
-        // Size constraints (use saturating_abs to handle i128::MIN)
-        if ret.exec_size.saturating_abs() > req_size.saturating_abs() { return false; }
-        if req_size != 0 {
-            if ret.exec_size.signum() != req_size.signum() { return false; }
-        }
-        true
+        let matcher_ret = ret.to_matcher_return();
+        crate::matcher_abi::validate_matcher_return(
+            &matcher_ret,
+            expected_lp_account_id,
+            expected_oracle_price_e6,
+            req_size,
+            expected_req_id,
+        ).is_ok()
     }
 
     /// Decision function for TradeCpi that computes ABI validity from real inputs.
@@ -755,8 +749,8 @@ pub mod matcher_abi {
             return Ok(());
         }
 
-        // Size constraints (use saturating_abs to handle i128::MIN)
-        if ret.exec_size.saturating_abs() > req_size.saturating_abs() { return Err(ProgramError::InvalidAccountData); }
+        // Size constraints (use unsigned_abs to avoid i128::MIN overflow)
+        if ret.exec_size.unsigned_abs() > req_size.unsigned_abs() { return Err(ProgramError::InvalidAccountData); }
         if req_size != 0 {
             if ret.exec_size.signum() != req_size.signum() { return Err(ProgramError::InvalidAccountData); }
         }
