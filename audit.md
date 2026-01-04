@@ -4,8 +4,8 @@
 
 **Date:** 2026-01-04
 **Kani Version:** 0.66.0
-**Total Proofs:** 60
-**Passed:** 60
+**Total Proofs:** 80
+**Passed:** 80
 **Failed:** 0
 
 ## Proof Categories
@@ -137,6 +137,42 @@ These subsume all specific nonce proofs with universal quantification.
 | kani_tradecpi_any_reject_nonce_unchanged | ANY rejection -> nonce unchanged |
 | kani_tradecpi_any_accept_increments_nonce | ANY acceptance -> nonce += 1 |
 
+### P. Account Validation Helpers (6 proofs)
+| Harness | Property |
+|---------|----------|
+| kani_signer_ok_true | signer_ok(true) = true |
+| kani_signer_ok_false | signer_ok(false) = false |
+| kani_writable_ok_true | writable_ok(true) = true |
+| kani_writable_ok_false | writable_ok(false) = false |
+| kani_len_ok_sufficient | actual >= need -> len_ok = true |
+| kani_len_ok_insufficient | actual < need -> len_ok = false |
+
+### Q. LP PDA Shape Validation (4 proofs)
+| Harness | Property |
+|---------|----------|
+| kani_lp_pda_shape_valid | Valid LP PDA shape accepted |
+| kani_lp_pda_rejects_wrong_owner | Non-system-owned LP PDA rejected |
+| kani_lp_pda_rejects_has_data | LP PDA with data rejected |
+| kani_lp_pda_rejects_funded | Funded LP PDA rejected |
+
+### R. Oracle Key and Slab Shape (4 proofs)
+| Harness | Property |
+|---------|----------|
+| kani_oracle_key_match | Matching oracle keys accepted |
+| kani_oracle_key_mismatch | Mismatched oracle keys rejected |
+| kani_slab_shape_valid | Valid slab shape accepted |
+| kani_slab_shape_invalid | Invalid slab shape rejected |
+
+### S. Simple Decision Functions (6 proofs)
+| Harness | Property |
+|---------|----------|
+| kani_decide_single_owner_accepts | Auth ok -> accept |
+| kani_decide_single_owner_rejects | Auth fail -> reject |
+| kani_decide_crank_accepts | Crank authorized -> accept |
+| kani_decide_crank_rejects | Crank unauthorized -> reject |
+| kani_decide_admin_accepts | Valid admin -> accept |
+| kani_decide_admin_rejects | Invalid admin -> reject |
+
 ## Key Security Properties Proven
 
 ### Authorization Surface
@@ -187,6 +223,16 @@ pub mod verify {
     pub fn cpi_trade_size(exec_size, requested_size) -> i128
     pub fn crank_authorized(idx_exists, stored_owner, signer) -> bool
 
+    // Account validation helpers
+    pub fn signer_ok(is_signer: bool) -> bool
+    pub fn writable_ok(is_writable: bool) -> bool
+    pub fn len_ok(actual: usize, need: usize) -> bool
+    pub struct LpPdaShape { is_system_owned, data_len_zero, lamports_zero }
+    pub fn lp_pda_shape_ok(shape: LpPdaShape) -> bool
+    pub fn oracle_key_ok(expected, provided) -> bool
+    pub struct SlabShape { owned_by_program, correct_len }
+    pub fn slab_shape_ok(shape: SlabShape) -> bool
+
     // Per-instruction authorization
     pub fn single_owner_authorized(stored_owner, signer) -> bool
     pub fn trade_authorized(user_owner, user_signer, lp_owner, lp_signer) -> bool
@@ -198,6 +244,11 @@ pub mod verify {
 
     pub enum TradeNoCpiDecision { Reject, Accept }
     pub fn decide_trade_nocpi(...) -> TradeNoCpiDecision
+
+    pub enum SimpleDecision { Reject, Accept }
+    pub fn decide_single_owner_op(owner_auth_ok) -> SimpleDecision
+    pub fn decide_crank(idx_exists, stored_owner, signer) -> SimpleDecision
+    pub fn decide_admin_op(admin, signer) -> SimpleDecision
 }
 ```
 

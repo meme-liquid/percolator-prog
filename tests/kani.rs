@@ -28,10 +28,15 @@ use percolator_prog::verify::{
     owner_ok, admin_ok, matcher_identity_ok, matcher_shape_ok, MatcherAccountsShape,
     gate_active, nonce_on_success, nonce_on_failure, pda_key_matches, cpi_trade_size,
     crank_authorized,
+    // Account validation helpers
+    signer_ok, writable_ok, len_ok,
+    LpPdaShape, lp_pda_shape_ok, oracle_key_ok,
+    SlabShape, slab_shape_ok,
     // Decision helpers for program-level coupling proofs
     single_owner_authorized, trade_authorized,
     TradeCpiDecision, decide_trade_cpi, decision_nonce,
     TradeNoCpiDecision, decide_trade_nocpi,
+    SimpleDecision, decide_single_owner_op, decide_crank, decide_admin_op,
 };
 
 // =============================================================================
@@ -1138,4 +1143,211 @@ fn kani_tradecpi_any_accept_increments_nonce() {
     let result_nonce = decision_nonce(old_nonce, decision);
     assert_eq!(result_nonce, old_nonce.wrapping_add(1),
         "ANY TradeCpi acceptance must increment nonce by 1");
+}
+
+// =============================================================================
+// Q. ACCOUNT VALIDATION HELPERS (6 proofs)
+// =============================================================================
+
+/// Prove: signer_ok reflects is_signer truthfully
+#[kani::proof]
+fn kani_signer_ok_true() {
+    assert!(signer_ok(true), "signer_ok(true) must be true");
+}
+
+#[kani::proof]
+fn kani_signer_ok_false() {
+    assert!(!signer_ok(false), "signer_ok(false) must be false");
+}
+
+/// Prove: writable_ok reflects is_writable truthfully
+#[kani::proof]
+fn kani_writable_ok_true() {
+    assert!(writable_ok(true), "writable_ok(true) must be true");
+}
+
+#[kani::proof]
+fn kani_writable_ok_false() {
+    assert!(!writable_ok(false), "writable_ok(false) must be false");
+}
+
+/// Prove: len_ok requires actual >= need
+#[kani::proof]
+fn kani_len_ok_sufficient() {
+    let actual: usize = kani::any();
+    let need: usize = kani::any();
+    kani::assume(actual >= need);
+    assert!(len_ok(actual, need), "len_ok must pass when actual >= need");
+}
+
+#[kani::proof]
+fn kani_len_ok_insufficient() {
+    let actual: usize = kani::any();
+    let need: usize = kani::any();
+    kani::assume(actual < need);
+    assert!(!len_ok(actual, need), "len_ok must fail when actual < need");
+}
+
+// =============================================================================
+// R. LP PDA SHAPE VALIDATION (4 proofs)
+// =============================================================================
+
+/// Prove: valid LP PDA shape is accepted
+#[kani::proof]
+fn kani_lp_pda_shape_valid() {
+    let shape = LpPdaShape {
+        is_system_owned: true,
+        data_len_zero: true,
+        lamports_zero: true,
+    };
+    assert!(lp_pda_shape_ok(shape), "valid LP PDA shape must be accepted");
+}
+
+/// Prove: non-system-owned LP PDA is rejected
+#[kani::proof]
+fn kani_lp_pda_rejects_wrong_owner() {
+    let shape = LpPdaShape {
+        is_system_owned: false,
+        data_len_zero: true,
+        lamports_zero: true,
+    };
+    assert!(!lp_pda_shape_ok(shape), "non-system-owned LP PDA must be rejected");
+}
+
+/// Prove: LP PDA with data is rejected
+#[kani::proof]
+fn kani_lp_pda_rejects_has_data() {
+    let shape = LpPdaShape {
+        is_system_owned: true,
+        data_len_zero: false,
+        lamports_zero: true,
+    };
+    assert!(!lp_pda_shape_ok(shape), "LP PDA with data must be rejected");
+}
+
+/// Prove: funded LP PDA is rejected
+#[kani::proof]
+fn kani_lp_pda_rejects_funded() {
+    let shape = LpPdaShape {
+        is_system_owned: true,
+        data_len_zero: true,
+        lamports_zero: false,
+    };
+    assert!(!lp_pda_shape_ok(shape), "funded LP PDA must be rejected");
+}
+
+// =============================================================================
+// S. ORACLE KEY AND SLAB SHAPE (4 proofs)
+// =============================================================================
+
+/// Prove: oracle_key_ok accepts matching keys
+#[kani::proof]
+fn kani_oracle_key_match() {
+    let key: [u8; 32] = kani::any();
+    assert!(oracle_key_ok(key, key), "matching oracle keys must be accepted");
+}
+
+/// Prove: oracle_key_ok rejects mismatched keys
+#[kani::proof]
+fn kani_oracle_key_mismatch() {
+    let expected: [u8; 32] = kani::any();
+    let provided: [u8; 32] = kani::any();
+    kani::assume(expected != provided);
+    assert!(!oracle_key_ok(expected, provided), "mismatched oracle keys must be rejected");
+}
+
+/// Prove: valid slab shape is accepted
+#[kani::proof]
+fn kani_slab_shape_valid() {
+    let shape = SlabShape {
+        owned_by_program: true,
+        correct_len: true,
+    };
+    assert!(slab_shape_ok(shape), "valid slab shape must be accepted");
+}
+
+/// Prove: invalid slab shape is rejected
+#[kani::proof]
+fn kani_slab_shape_invalid() {
+    let owned: bool = kani::any();
+    let correct_len: bool = kani::any();
+    kani::assume(!owned || !correct_len);
+    let shape = SlabShape {
+        owned_by_program: owned,
+        correct_len: correct_len,
+    };
+    assert!(!slab_shape_ok(shape), "invalid slab shape must be rejected");
+}
+
+// =============================================================================
+// T. SIMPLE DECISION FUNCTIONS (6 proofs)
+// =============================================================================
+
+/// Prove: decide_single_owner_op accepts when auth ok
+#[kani::proof]
+fn kani_decide_single_owner_accepts() {
+    let decision = decide_single_owner_op(true);
+    assert_eq!(decision, SimpleDecision::Accept,
+        "decide_single_owner_op must accept when auth ok");
+}
+
+/// Prove: decide_single_owner_op rejects when auth fails
+#[kani::proof]
+fn kani_decide_single_owner_rejects() {
+    let decision = decide_single_owner_op(false);
+    assert_eq!(decision, SimpleDecision::Reject,
+        "decide_single_owner_op must reject when auth fails");
+}
+
+/// Prove: decide_crank accepts when crank authorized
+#[kani::proof]
+fn kani_decide_crank_accepts() {
+    let owner: [u8; 32] = kani::any();
+    // When idx exists and signer matches owner, or when idx doesn't exist
+    let decision1 = decide_crank(true, owner, owner);
+    assert_eq!(decision1, SimpleDecision::Accept, "crank must accept owner match");
+
+    let signer: [u8; 32] = kani::any();
+    let stored: [u8; 32] = kani::any();
+    let decision2 = decide_crank(false, stored, signer);
+    assert_eq!(decision2, SimpleDecision::Accept, "crank must accept non-existent account");
+}
+
+/// Prove: decide_crank rejects unauthorized
+#[kani::proof]
+fn kani_decide_crank_rejects() {
+    let stored: [u8; 32] = kani::any();
+    let signer: [u8; 32] = kani::any();
+    kani::assume(stored != signer);
+
+    let decision = decide_crank(true, stored, signer);
+    assert_eq!(decision, SimpleDecision::Reject,
+        "crank must reject owner mismatch on existing account");
+}
+
+/// Prove: decide_admin_op accepts valid admin
+#[kani::proof]
+fn kani_decide_admin_accepts() {
+    let admin: [u8; 32] = kani::any();
+    kani::assume(admin != [0u8; 32]);
+
+    let decision = decide_admin_op(admin, admin);
+    assert_eq!(decision, SimpleDecision::Accept,
+        "admin op must accept matching non-burned admin");
+}
+
+/// Prove: decide_admin_op rejects invalid admin
+#[kani::proof]
+fn kani_decide_admin_rejects() {
+    // Case 1: burned admin
+    let signer: [u8; 32] = kani::any();
+    let decision1 = decide_admin_op([0u8; 32], signer);
+    assert_eq!(decision1, SimpleDecision::Reject, "burned admin must reject");
+
+    // Case 2: admin mismatch
+    let admin: [u8; 32] = kani::any();
+    kani::assume(admin != [0u8; 32]);
+    kani::assume(admin != signer);
+    let decision2 = decide_admin_op(admin, signer);
+    assert_eq!(decision2, SimpleDecision::Reject, "admin mismatch must reject");
 }

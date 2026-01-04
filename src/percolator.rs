@@ -261,6 +261,61 @@ pub mod verify {
     }
 
     // =========================================================================
+    // Account validation helpers
+    // =========================================================================
+
+    /// Signer requirement: account must be a signer.
+    #[inline]
+    pub fn signer_ok(is_signer: bool) -> bool {
+        is_signer
+    }
+
+    /// Writable requirement: account must be writable.
+    #[inline]
+    pub fn writable_ok(is_writable: bool) -> bool {
+        is_writable
+    }
+
+    /// Account count requirement: must have at least `need` accounts.
+    #[inline]
+    pub fn len_ok(actual: usize, need: usize) -> bool {
+        actual >= need
+    }
+
+    /// LP PDA shape validation for TradeCpi.
+    /// PDA must be system-owned, have zero data, and zero lamports.
+    #[derive(Clone, Copy)]
+    pub struct LpPdaShape {
+        pub is_system_owned: bool,
+        pub data_len_zero: bool,
+        pub lamports_zero: bool,
+    }
+
+    #[inline]
+    pub fn lp_pda_shape_ok(s: LpPdaShape) -> bool {
+        s.is_system_owned && s.data_len_zero && s.lamports_zero
+    }
+
+    /// Oracle key check: provided oracle must match expected config oracle.
+    #[inline]
+    pub fn oracle_key_ok(expected: [u8; 32], provided: [u8; 32]) -> bool {
+        expected == provided
+    }
+
+    /// Slab shape validation.
+    /// Slab must be owned by this program and have correct length.
+    #[derive(Clone, Copy)]
+    pub struct SlabShape {
+        pub owned_by_program: bool,
+        pub correct_len: bool,
+    }
+
+    #[inline]
+    pub fn slab_shape_ok(s: SlabShape) -> bool {
+        s.owned_by_program && s.correct_len
+    }
+
+    // =========================================================================
     // Per-instruction authorization helpers
     // =========================================================================
 
@@ -388,6 +443,51 @@ pub mod verify {
             return TradeNoCpiDecision::Reject;
         }
         TradeNoCpiDecision::Accept
+    }
+
+    // =========================================================================
+    // Other instruction decision logic
+    // =========================================================================
+
+    /// Simple Accept/Reject decision for single-check instructions.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SimpleDecision {
+        Reject,
+        Accept,
+    }
+
+    /// Decision for Deposit/Withdraw/Close: requires owner authorization.
+    #[inline]
+    pub fn decide_single_owner_op(owner_auth_ok: bool) -> SimpleDecision {
+        if owner_auth_ok {
+            SimpleDecision::Accept
+        } else {
+            SimpleDecision::Reject
+        }
+    }
+
+    /// Decision for KeeperCrank: uses crank_authorized logic.
+    #[inline]
+    pub fn decide_crank(
+        idx_exists: bool,
+        stored_owner: [u8; 32],
+        signer: [u8; 32],
+    ) -> SimpleDecision {
+        if crank_authorized(idx_exists, stored_owner, signer) {
+            SimpleDecision::Accept
+        } else {
+            SimpleDecision::Reject
+        }
+    }
+
+    /// Decision for admin operations (SetRiskThreshold, UpdateAdmin).
+    #[inline]
+    pub fn decide_admin_op(admin: [u8; 32], signer: [u8; 32]) -> SimpleDecision {
+        if admin_ok(admin, signer) {
+            SimpleDecision::Accept
+        } else {
+            SimpleDecision::Reject
+        }
     }
 }
 
@@ -1586,17 +1686,17 @@ pub mod processor {
                     &[b"lp", a_slab.key.as_ref(), &lp_bytes],
                     program_id
                 );
-                if a_lp_pda.key != &expected_lp_pda {
+                // PDA key validation via verify helper (Kani-provable)
+                if !crate::verify::pda_key_matches(expected_lp_pda.to_bytes(), a_lp_pda.key.to_bytes()) {
                     return Err(ProgramError::InvalidSeeds);
                 }
-                if a_lp_pda.owner != &solana_program::system_program::ID {
-                    return Err(ProgramError::IllegalOwner);
-                }
-                if a_lp_pda.data_len() != 0 {
-                    return Err(ProgramError::InvalidAccountData);
-                }
-                // Pure identity PDA: must have 0 lamports (not funded)
-                if **a_lp_pda.lamports.borrow() != 0 {
+                // LP PDA shape validation via verify helper (Kani-provable)
+                let lp_pda_shape = crate::verify::LpPdaShape {
+                    is_system_owned: a_lp_pda.owner == &solana_program::system_program::ID,
+                    data_len_zero: a_lp_pda.data_len() == 0,
+                    lamports_zero: **a_lp_pda.lamports.borrow() == 0,
+                };
+                if !crate::verify::lp_pda_shape_ok(lp_pda_shape) {
                     return Err(ProgramError::InvalidAccountData);
                 }
 
