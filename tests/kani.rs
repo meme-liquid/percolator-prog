@@ -27,7 +27,6 @@ use percolator_prog::constants::MATCHER_ABI_VERSION;
 use percolator_prog::verify::{
     owner_ok, admin_ok, matcher_identity_ok, matcher_shape_ok, MatcherAccountsShape,
     gate_active, nonce_on_success, nonce_on_failure, pda_key_matches, cpi_trade_size,
-    crank_authorized,
     // Account validation helpers
     signer_ok, writable_ok, len_ok,
     LpPdaShape, lp_pda_shape_ok, oracle_key_ok,
@@ -606,47 +605,7 @@ fn kani_gate_active_when_conditions_met() {
 }
 
 // =============================================================================
-// J. KEEPER CRANK AUTHORIZATION (3 proofs)
-// =============================================================================
-
-/// Prove: crank authorized when account doesn't exist
-#[kani::proof]
-fn kani_crank_authorized_no_account() {
-    let signer: [u8; 32] = kani::any();
-    let stored_owner: [u8; 32] = kani::any();
-
-    assert!(
-        crank_authorized(false, stored_owner, signer),
-        "crank must be authorized when account doesn't exist"
-    );
-}
-
-/// Prove: crank authorized when signer matches owner
-#[kani::proof]
-fn kani_crank_authorized_owner_match() {
-    let owner: [u8; 32] = kani::any();
-
-    assert!(
-        crank_authorized(true, owner, owner),
-        "crank must be authorized when signer matches owner"
-    );
-}
-
-/// Prove: crank rejected when signer doesn't match owner
-#[kani::proof]
-fn kani_crank_rejected_owner_mismatch() {
-    let stored_owner: [u8; 32] = kani::any();
-    let signer: [u8; 32] = kani::any();
-    kani::assume(stored_owner != signer);
-
-    assert!(
-        !crank_authorized(true, stored_owner, signer),
-        "crank must be rejected when signer doesn't match existing account owner"
-    );
-}
-
-// =============================================================================
-// K. PER-INSTRUCTION AUTHORIZATION (4 proofs)
+// J. PER-INSTRUCTION AUTHORIZATION (4 proofs)
 // =============================================================================
 
 /// Prove: single-owner instruction rejects on mismatch
@@ -1309,30 +1268,47 @@ fn kani_decide_single_owner_rejects() {
         "decide_single_owner_op must reject when auth fails");
 }
 
-/// Prove: decide_crank accepts when crank authorized
+/// Prove: decide_crank accepts in permissionless mode
 #[kani::proof]
-fn kani_decide_crank_accepts() {
-    let owner: [u8; 32] = kani::any();
-    // When idx exists and signer matches owner, or when idx doesn't exist
-    let decision1 = decide_crank(true, owner, owner);
-    assert_eq!(decision1, SimpleDecision::Accept, "crank must accept owner match");
-
-    let signer: [u8; 32] = kani::any();
+fn kani_decide_crank_permissionless_accepts() {
+    let idx_exists: bool = kani::any();
     let stored: [u8; 32] = kani::any();
-    let decision2 = decide_crank(false, stored, signer);
-    assert_eq!(decision2, SimpleDecision::Accept, "crank must accept non-existent account");
+    let signer: [u8; 32] = kani::any();
+    // Permissionless mode always accepts regardless of idx/owner
+    let decision = decide_crank(true, idx_exists, stored, signer);
+    assert_eq!(decision, SimpleDecision::Accept, "permissionless crank must always accept");
 }
 
-/// Prove: decide_crank rejects unauthorized
+/// Prove: decide_crank accepts self-crank when idx exists and owner matches
 #[kani::proof]
-fn kani_decide_crank_rejects() {
+fn kani_decide_crank_self_accepts() {
+    let owner: [u8; 32] = kani::any();
+    // Self-crank mode with valid idx and matching owner
+    let decision = decide_crank(false, true, owner, owner);
+    assert_eq!(decision, SimpleDecision::Accept, "self-crank must accept when idx exists and owner matches");
+}
+
+/// Prove: decide_crank rejects self-crank when idx doesn't exist
+#[kani::proof]
+fn kani_decide_crank_rejects_no_idx() {
+    let stored: [u8; 32] = kani::any();
+    let signer: [u8; 32] = kani::any();
+    // Self-crank mode with non-existent idx must reject
+    let decision = decide_crank(false, false, stored, signer);
+    assert_eq!(decision, SimpleDecision::Reject,
+        "self-crank must reject when idx doesn't exist");
+}
+
+/// Prove: decide_crank rejects self-crank when owner doesn't match
+#[kani::proof]
+fn kani_decide_crank_rejects_wrong_owner() {
     let stored: [u8; 32] = kani::any();
     let signer: [u8; 32] = kani::any();
     kani::assume(stored != signer);
-
-    let decision = decide_crank(true, stored, signer);
+    // Self-crank mode with existing idx but wrong owner must reject
+    let decision = decide_crank(false, true, stored, signer);
     assert_eq!(decision, SimpleDecision::Reject,
-        "crank must reject owner mismatch on existing account");
+        "self-crank must reject when owner doesn't match");
 }
 
 /// Prove: decide_admin_op accepts valid admin

@@ -248,21 +248,6 @@ pub mod verify {
         exec_size // Must use exec_size, never requested_size
     }
 
-    /// KeeperCrank authorization: if account exists at idx, signer must be owner.
-    /// If account doesn't exist (idx out of bounds or not used), anyone can crank.
-    #[inline]
-    pub fn crank_authorized(
-        idx_exists: bool,
-        stored_owner: [u8; 32],
-        signer: [u8; 32],
-    ) -> bool {
-        if idx_exists {
-            stored_owner == signer
-        } else {
-            true // Anyone can crank non-existent accounts
-        }
-    }
-
     // =========================================================================
     // Account validation helpers
     // =========================================================================
@@ -589,14 +574,19 @@ pub mod verify {
         }
     }
 
-    /// Decision for KeeperCrank: uses crank_authorized logic.
+    /// Decision for KeeperCrank:
+    /// - Permissionless mode (caller_idx == u16::MAX): always accept
+    /// - Self-crank mode: idx must exist AND owner must match signer
     #[inline]
     pub fn decide_crank(
+        permissionless: bool,
         idx_exists: bool,
         stored_owner: [u8; 32],
         signer: [u8; 32],
     ) -> SimpleDecision {
-        if crank_authorized(idx_exists, stored_owner, signer) {
+        if permissionless {
+            SimpleDecision::Accept
+        } else if idx_exists && owner_ok(stored_owner, signer) {
             SimpleDecision::Accept
         } else {
             SimpleDecision::Reject
@@ -1723,17 +1713,13 @@ pub mod processor {
 
                 let engine = zc::engine_mut(&mut data)?;
 
-                // Crank authorization via verify helper (Kani-provable)
-                // In permissionless mode, idx_exists is false (u16::MAX >= MAX_ACCOUNTS),
-                // so crank_authorized returns true for anyone.
+                // Crank authorization:
+                // - Permissionless mode (caller_idx == u16::MAX): anyone can crank
+                // - Self-crank mode: caller_idx must be a valid, existing account owned by signer
                 if !permissionless {
-                    let idx_exists = (caller_idx as usize) < MAX_ACCOUNTS && engine.is_used(caller_idx as usize);
-                    let stored_owner = if idx_exists {
-                        engine.accounts[caller_idx as usize].owner
-                    } else {
-                        [0u8; 32]
-                    };
-                    if !crate::verify::crank_authorized(idx_exists, stored_owner, a_caller.key.to_bytes()) {
+                    check_idx(engine, caller_idx)?;
+                    let stored_owner = engine.accounts[caller_idx as usize].owner;
+                    if !crate::verify::owner_ok(stored_owner, a_caller.key.to_bytes()) {
                         return Err(PercolatorError::EngineUnauthorized.into());
                     }
                 }
@@ -3209,13 +3195,17 @@ mod tests {
         // - position_size = 0 (already 0)
         // - reserved_pnl = 0 (already 0)
         // - funding_index = engine.funding_index_qpb_e6
+        // - fee_credits = 0, last_fee_slot = current_slot (robustness against future predicates)
         {
             let engine = zc::engine_mut(&mut f.slab.data).unwrap();
             let funding_idx = engine.funding_index_qpb_e6;
+            let current_slot = engine.current_slot;
             let account = &mut engine.accounts[user_idx as usize];
             account.capital = 0;
             account.pnl = -1;
             account.funding_index = funding_idx;
+            account.fee_credits = 0;
+            account.last_fee_slot = current_slot;
         }
 
         // Verify account is now a dust candidate
