@@ -4186,4 +4186,392 @@ mod tests {
             assert_ne!(res, Err(ProgramError::InvalidInstructionData), "Aligned withdrawal should not fail on alignment");
         }
     }
+
+    // ========================================
+    // VAULT ACCOUNTING INVARIANT TESTS
+    // ========================================
+
+    /// Helper: read sum of all account capitals from engine
+    fn sum_account_capitals(slab_data: &[u8]) -> u128 {
+        let engine = zc::engine_ref(slab_data).unwrap();
+        let mut total = 0u128;
+        for idx in 0..percolator::MAX_ACCOUNTS {
+            if engine.is_used(idx) {
+                total = total.saturating_add(engine.accounts[idx].capital);
+            }
+        }
+        total
+    }
+
+    #[test]
+    fn test_vault_amount_matches_engine_vault_plus_dust() {
+        // INVARIANT #1: SPL vault balance = engine.vault * unit_scale + dust_base
+        //
+        // Setup: market with unit_scale=10, deposit 123 base tokens
+        // Expected: 12 units, 3 dust
+        let mut f = setup_market();
+        let unit_scale: u32 = 10;
+
+        // Init market with unit_scale=10
+        {
+            let data = encode_init_market_invert(&f, 100, 0, unit_scale);
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        // Create user with enough tokens
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+            make_token_account(f.mint.key, user.key, 10_000)).writable();
+
+        // InitUser with fee=0 (so it doesn't affect accounting)
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        // Record initial state
+        let dust_start = state::read_dust_base(&f.slab.data);
+        let engine_vault_start = zc::engine_ref(&f.slab.data).unwrap().vault;
+        let vault_base_start = TokenAccount::unpack(&f.vault.data).unwrap().amount;
+
+        // Deposit 123 base tokens (creates 12 units + 3 dust)
+        let deposit_amount: u64 = 123;
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, deposit_amount)).unwrap();
+        }
+
+        // Read post-deposit state
+        let vault_base = TokenAccount::unpack(&f.vault.data).unwrap().amount;
+        let engine_vault_units = zc::engine_ref(&f.slab.data).unwrap().vault;
+        let dust_base = state::read_dust_base(&f.slab.data);
+
+        // Compute deltas
+        let delta_vault_base = vault_base - vault_base_start;
+        let delta_engine_units = engine_vault_units - engine_vault_start;
+        let delta_dust = dust_base - dust_start;
+
+        // Assert expected deltas
+        assert_eq!(delta_vault_base, deposit_amount,
+            "SPL vault should increase by deposit amount: got {}, expected {}", delta_vault_base, deposit_amount);
+        assert_eq!(delta_engine_units, (deposit_amount / unit_scale as u64) as u128,
+            "Engine vault should increase by deposit/scale: got {}, expected {}", delta_engine_units, deposit_amount / unit_scale as u64);
+        assert_eq!(delta_dust, deposit_amount % unit_scale as u64,
+            "Dust should equal deposit mod scale: got {}, expected {}", delta_dust, deposit_amount % unit_scale as u64);
+
+        // Assert INVARIANT #1: vault_base = engine_vault * unit_scale + dust_base
+        let computed_base = engine_vault_units as u64 * unit_scale as u64 + dust_base;
+        assert_eq!(vault_base, computed_base,
+            "INVARIANT #1 FAILED: vault_base({}) != engine_vault({}) * scale({}) + dust({}) = {}",
+            vault_base, engine_vault_units, unit_scale, dust_base, computed_base);
+    }
+
+    #[test]
+    fn test_engine_vault_equals_insurance_plus_capital_when_no_fees() {
+        // INVARIANT #2: engine.vault = insurance_fund.balance + sum(account.capital)
+        //
+        // This holds when:
+        // - new_account_fee = 0
+        // - no trades (no trading fees, no PnL)
+        // - no topups
+        //
+        // The existing encode_init_market_invert already uses all-zero fees.
+        let mut f = setup_market();
+        let unit_scale: u32 = 10;
+
+        // Init market with unit_scale=10, all fees=0
+        {
+            let data = encode_init_market_invert(&f, 100, 0, unit_scale);
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        // Create and fund two users
+        let mut user1 = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user1_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+            make_token_account(f.mint.key, user1.key, 10_000)).writable();
+        {
+            let accounts = vec![
+                user1.to_info(), f.slab.to_info(), user1_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user1_idx = find_idx_by_owner(&f.slab.data, user1.key).unwrap();
+
+        let mut user2 = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user2_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+            make_token_account(f.mint.key, user2.key, 10_000)).writable();
+        {
+            let accounts = vec![
+                user2.to_info(), f.slab.to_info(), user2_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user2_idx = find_idx_by_owner(&f.slab.data, user2.key).unwrap();
+
+        // Deposit different amounts (aligned to avoid dust complicating this test)
+        {
+            let accounts = vec![
+                user1.to_info(), f.slab.to_info(), user1_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user1_idx, 500)).unwrap(); // 50 units
+        }
+        {
+            let accounts = vec![
+                user2.to_info(), f.slab.to_info(), user2_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user2_idx, 300)).unwrap(); // 30 units
+        }
+
+        // Read engine state
+        let engine = zc::engine_ref(&f.slab.data).unwrap();
+        let engine_vault = engine.vault;
+        let insurance_balance = engine.insurance_fund.balance;
+        let sum_capital = sum_account_capitals(&f.slab.data);
+
+        // Assert INVARIANT #2: vault = insurance + sum(capital)
+        // (In no-fee scenario with no PnL, this should hold exactly)
+        let expected_vault = insurance_balance + sum_capital;
+        assert_eq!(engine_vault, expected_vault,
+            "INVARIANT #2 FAILED: engine.vault({}) != insurance({}) + sum_capital({}) = {}\n\
+             user1.capital={}, user2.capital={}",
+            engine_vault, insurance_balance, sum_capital, expected_vault,
+            engine.accounts[user1_idx as usize].capital,
+            engine.accounts[user2_idx as usize].capital);
+    }
+
+    #[test]
+    fn test_withdraw_preserves_vault_accounting_invariant() {
+        // Verify that aligned withdrawals preserve INVARIANT #1
+        let mut f = setup_market();
+        let unit_scale: u32 = 10;
+
+        // Init market with unit_scale=10
+        {
+            let data = encode_init_market_invert(&f, 100, 0, unit_scale);
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        // Create user
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+            make_token_account(f.mint.key, user.key, 10_000)).writable();
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        // Deposit 230 base tokens (creates 23 units + 0 dust)
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 230)).unwrap();
+        }
+
+        // Record pre-withdraw state
+        let vault_base_before = TokenAccount::unpack(&f.vault.data).unwrap().amount;
+        let engine_vault_before = zc::engine_ref(&f.slab.data).unwrap().vault;
+        let dust_before = state::read_dust_base(&f.slab.data);
+
+        // Withdraw 50 base tokens (aligned: 5 units)
+        let mut vault_pda_account = TestAccount::new(f.vault_pda, Pubkey::default(), 0, vec![]);
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), f.vault.to_info(), user_ata.to_info(),
+                vault_pda_account.to_info(),
+                f.token_prog.to_info(), f.clock.to_info(), f.pyth_index.to_info()
+            ];
+            // Note: token transfer CPI will fail in test env, but engine state updates happen first
+            let _ = process_instruction(&f.program_id, &accounts, &encode_withdraw(user_idx, 50));
+        }
+
+        // Read post-withdraw state
+        // Note: In test env, the SPL vault may not update due to CPI mock,
+        // but engine state DOES update. We verify engine state consistency.
+        let engine_vault_after = zc::engine_ref(&f.slab.data).unwrap().vault;
+        let dust_after = state::read_dust_base(&f.slab.data);
+
+        // Verify engine vault decreased by expected units
+        assert_eq!(engine_vault_before - engine_vault_after, 5,
+            "Engine vault should decrease by 5 units: before={}, after={}", engine_vault_before, engine_vault_after);
+
+        // Verify dust unchanged (withdrawal was aligned)
+        assert_eq!(dust_before, dust_after,
+            "Dust should be unchanged for aligned withdrawal: before={}, after={}", dust_before, dust_after);
+    }
+
+    #[test]
+    fn test_dust_sweep_preserves_real_to_accounted_equality() {
+        // DUST POLICY: Dust is swept to insurance via top_up_insurance_fund,
+        // which covers loss_accum first, then adds to insurance_fund.balance.
+        //
+        // This test verifies:
+        // 1. dust_base < unit_scale after sweep
+        // 2. INVARIANT #1 still holds
+        // 3. Insurance increased by floor(old_dust / scale) units
+        let mut f = setup_market();
+        let unit_scale: u32 = 10;
+
+        // Init market with unit_scale=10
+        {
+            let data = encode_init_market_invert(&f, 100, 0, unit_scale);
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        // Create user for crank caller
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+            make_token_account(f.mint.key, user.key, 10_000)).writable();
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        // Make multiple deposits that accumulate dust > unit_scale
+        // Each deposit of 27 creates 2 units + 7 dust
+        // After 2 deposits: 4 units + 14 dust (14 >= 10, so sweep will happen)
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 27)).unwrap();
+        }
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 27)).unwrap();
+        }
+
+        // Record pre-crank state
+        let dust_before_crank = state::read_dust_base(&f.slab.data);
+        let engine_vault_before = zc::engine_ref(&f.slab.data).unwrap().vault;
+        let insurance_before = zc::engine_ref(&f.slab.data).unwrap().insurance_fund.balance;
+
+        assert!(dust_before_crank >= unit_scale as u64,
+            "Dust should be >= unit_scale before crank: dust={}, scale={}", dust_before_crank, unit_scale);
+
+        // Call KeeperCrank - this triggers dust sweep
+        {
+            let accounts = vec![user.to_info(), f.slab.to_info(), f.clock.to_info(), f.pyth_index.to_info()];
+            process_instruction(&f.program_id, &accounts, &encode_crank(user_idx, 0)).unwrap();
+        }
+
+        // Read post-crank state
+        let dust_after_crank = state::read_dust_base(&f.slab.data);
+        let engine_vault_after = zc::engine_ref(&f.slab.data).unwrap().vault;
+        let insurance_after = zc::engine_ref(&f.slab.data).unwrap().insurance_fund.balance;
+        let vault_base = TokenAccount::unpack(&f.vault.data).unwrap().amount;
+
+        // Verify dust was swept
+        assert!(dust_after_crank < unit_scale as u64,
+            "Dust should be < unit_scale after sweep: dust={}, scale={}", dust_after_crank, unit_scale);
+
+        // Calculate expected sweep
+        let units_swept = dust_before_crank / unit_scale as u64;
+        let expected_remaining_dust = dust_before_crank % unit_scale as u64;
+
+        assert_eq!(dust_after_crank, expected_remaining_dust,
+            "Remaining dust should be old_dust mod scale: got {}, expected {}", dust_after_crank, expected_remaining_dust);
+
+        // Verify insurance increased by swept units (assuming no loss_accum)
+        assert_eq!(insurance_after - insurance_before, units_swept as u128,
+            "Insurance should increase by swept units: delta={}, expected={}", insurance_after - insurance_before, units_swept);
+
+        // Verify engine.vault also increased by swept units
+        assert_eq!(engine_vault_after - engine_vault_before, units_swept as u128,
+            "Engine vault should increase by swept units: delta={}, expected={}", engine_vault_after - engine_vault_before, units_swept);
+
+        // Verify INVARIANT #1 still holds after sweep
+        let computed_base = engine_vault_after as u64 * unit_scale as u64 + dust_after_crank;
+        assert_eq!(vault_base, computed_base,
+            "INVARIANT #1 FAILED after sweep: vault_base({}) != engine_vault({}) * scale({}) + dust({}) = {}",
+            vault_base, engine_vault_after, unit_scale, dust_after_crank, computed_base);
+    }
+
+    #[test]
+    fn test_invariants_with_unit_scale_zero() {
+        // Verify invariants work when unit_scale=0 (no scaling)
+        // In this mode: 1 base token = 1 unit, no dust ever created
+        let mut f = setup_market();
+
+        // Init market with unit_scale=0 (standard behavior)
+        {
+            let data = encode_init_market_invert(&f, 100, 0, 0);
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        // Create user
+        let mut user = TestAccount::new(Pubkey::new_unique(), solana_program::system_program::id(), 0, vec![]).signer();
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+            make_token_account(f.mint.key, user.key, 10_000)).writable();
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(0)).unwrap();
+        }
+        let user_idx = find_idx_by_owner(&f.slab.data, user.key).unwrap();
+
+        // Deposit any amount - should create 0 dust
+        {
+            let accounts = vec![
+                user.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(user_idx, 123)).unwrap();
+        }
+
+        // Verify no dust created
+        let dust = state::read_dust_base(&f.slab.data);
+        assert_eq!(dust, 0, "Dust should be 0 when unit_scale=0: got {}", dust);
+
+        // Verify INVARIANT #1: vault_base = engine_vault (scale=1) + dust (0)
+        let vault_base = TokenAccount::unpack(&f.vault.data).unwrap().amount;
+        let engine_vault = zc::engine_ref(&f.slab.data).unwrap().vault;
+        assert_eq!(vault_base, engine_vault as u64,
+            "With scale=0: vault_base({}) should equal engine_vault({})", vault_base, engine_vault);
+
+        // Verify INVARIANT #2
+        let engine = zc::engine_ref(&f.slab.data).unwrap();
+        let sum_capital = sum_account_capitals(&f.slab.data);
+        assert_eq!(engine.vault, engine.insurance_fund.balance + sum_capital,
+            "INVARIANT #2: vault({}) != insurance({}) + capital({})",
+            engine.vault, engine.insurance_fund.balance, sum_capital);
+    }
 }
