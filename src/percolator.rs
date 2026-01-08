@@ -1708,6 +1708,14 @@ pub mod processor {
                     let _ = Mint::unpack(&mint_data)?;
                 }
 
+                // Validate unit_scale: reject huge values that make most deposits credit 0 units
+                // unit_scale=0 disables scaling (1:1 base tokens to units)
+                // unit_scale=1_000_000_000 allows for up to 9 decimal places of precision loss
+                const MAX_UNIT_SCALE: u32 = 1_000_000_000;
+                if unit_scale > MAX_UNIT_SCALE {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+
                 #[cfg(debug_assertions)]
                 {
                     if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
@@ -1927,6 +1935,11 @@ pub mod processor {
                     config.conf_filter_bps,
                     config.invert,
                 )?;
+
+                // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
+                if config.unit_scale != 0 && amount % config.unit_scale as u64 != 0 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
 
                 // Convert requested base tokens to units
                 let (units_requested, _) = crate::units::base_to_units(amount, config.unit_scale);
@@ -2757,6 +2770,33 @@ mod tests {
         encode_u16(500, &mut data);
         data.push(0u8); // invert (0 = no inversion)
         encode_u32(0, &mut data); // unit_scale (0 = no scaling)
+
+        encode_u64(0, &mut data);
+        encode_u64(0, &mut data);
+        encode_u64(0, &mut data);
+        encode_u64(0, &mut data);
+        encode_u64(64, &mut data);
+        encode_u128(0, &mut data);
+        encode_u128(0, &mut data);
+        encode_u128(0, &mut data);
+        encode_u64(crank_staleness, &mut data);
+        encode_u64(0, &mut data);
+        encode_u128(0, &mut data);
+        encode_u64(0, &mut data);
+        encode_u128(0, &mut data);
+        data
+    }
+
+    fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, invert: u8, unit_scale: u32) -> Vec<u8> {
+        let mut data = vec![0u8];
+        encode_pubkey(&fixture.admin.key, &mut data);
+        encode_pubkey(&fixture.mint.key, &mut data);
+        encode_pubkey(&fixture.pyth_index.key, &mut data);
+        encode_pubkey(&fixture.pyth_col.key, &mut data);
+        encode_u64(100, &mut data);
+        encode_u16(500, &mut data);
+        data.push(invert);
+        encode_u32(unit_scale, &mut data);
 
         encode_u64(0, &mut data);
         encode_u64(0, &mut data);
@@ -4007,6 +4047,143 @@ mod tests {
             let accounts = vec![f.admin.to_info(), f.slab.to_info()];
             let res = process_instruction(&f.program_id, &accounts, &encode_update_admin(&original_admin_key));
             assert_eq!(res, Err(PercolatorError::EngineUnauthorized.into()));
+        }
+    }
+
+    #[test]
+    fn test_oracle_inversion() {
+        // Test that invert=1 correctly inverts the oracle price
+        // Raw price: $100 = 100_000_000 e6
+        // Inverted: 1e12 / 100_000_000 = 10_000 e6 (= $0.01 or 0.01 SOL/USD)
+        use crate::oracle::read_engine_price_e6;
+
+        let pyth_data = make_pyth(100_000_000, -6, 1, 100);
+        let mut oracle = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, pyth_data);
+
+        // Without inversion (invert=0)
+        let price_raw = read_engine_price_e6(&oracle.to_info(), 100, 100, 500, 0).unwrap();
+        assert_eq!(price_raw, 100_000_000, "Raw price should be $100 (100_000_000 e6)");
+
+        // With inversion (invert=1)
+        let price_inv = read_engine_price_e6(&oracle.to_info(), 100, 100, 500, 1).unwrap();
+        assert_eq!(price_inv, 10_000, "Inverted price should be 10_000 e6 (= 1e12 / 100_000_000)");
+    }
+
+    #[test]
+    fn test_unit_scale_conversion() {
+        // Test base_to_units and units_to_base with unit_scale
+        use crate::units::{base_to_units, units_to_base};
+
+        // With scale=0, no conversion
+        assert_eq!(base_to_units(12345, 0), (12345, 0));
+        assert_eq!(units_to_base(12345, 0), 12345);
+
+        // With scale=1000 (e.g., for wSOL where 1000 lamports = 1 unit)
+        assert_eq!(base_to_units(5500, 1000), (5, 500)); // 5 units, 500 dust
+        assert_eq!(base_to_units(5000, 1000), (5, 0));   // 5 units, no dust
+        assert_eq!(units_to_base(5, 1000), 5000);
+
+        // With scale=100
+        assert_eq!(base_to_units(201, 100), (2, 1));  // 2 units, 1 dust
+        assert_eq!(units_to_base(2, 100), 200);
+    }
+
+    #[test]
+    fn test_init_market_with_invert_and_unit_scale() {
+        // Test that InitMarket correctly stores invert and unit_scale in config
+        let mut f = setup_market();
+        let data = encode_init_market_invert(&f, 100, 1, 1000); // invert=1, unit_scale=1000
+
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        // Read back config and verify
+        let config = crate::state::read_config(&f.slab.data);
+        assert_eq!(config.invert, 1, "invert should be 1");
+        assert_eq!(config.unit_scale, 1000, "unit_scale should be 1000");
+    }
+
+    #[test]
+    fn test_unit_scale_validation_at_init() {
+        // Test that unit_scale > 1_000_000_000 is rejected
+        let mut f = setup_market();
+        let data = encode_init_market_invert(&f, 100, 0, 2_000_000_000); // Too large
+
+        {
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            let res = process_instruction(&f.program_id, &accounts, &data);
+            assert_eq!(res, Err(ProgramError::InvalidInstructionData), "Should reject unit_scale > 1B");
+        }
+    }
+
+    #[test]
+    fn test_withdraw_misalignment_rejected() {
+        // Test that misaligned withdrawal amounts are rejected when unit_scale != 0
+        let mut f = setup_market();
+
+        // Init market with unit_scale=100
+        {
+            let data = encode_init_market_invert(&f, 100, 0, 100);
+            let mut dummy_ata = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0, vec![]);
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.mint.to_info(), f.vault.to_info(), f.token_prog.to_info(),
+                dummy_ata.to_info(), f.system.to_info(), f.rent.to_info(), f.pyth_index.to_info(), f.pyth_col.to_info(), f.clock.to_info(),
+            ];
+            process_instruction(&f.program_id, &accounts, &data).unwrap();
+        }
+
+        // Init user
+        let mut user_ata = TestAccount::new(Pubkey::new_unique(), spl_token::ID, 0,
+            make_token_account(f.mint.key, f.admin.key, 1_000_000)).writable();
+        {
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_init_user(1000)).unwrap();
+        }
+
+        // Deposit 1000 (aligned to unit_scale=100)
+        {
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), user_ata.to_info(), f.vault.to_info(), f.token_prog.to_info()
+            ];
+            process_instruction(&f.program_id, &accounts, &encode_deposit(0, 1000)).unwrap();
+        }
+
+        // Create vault_pda account for withdraw tests
+        let mut vault_pda_account = TestAccount::new(f.vault_pda, Pubkey::default(), 0, vec![]);
+
+        // Try to withdraw 201 (misaligned) - should fail
+        {
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.vault.to_info(), user_ata.to_info(),
+                vault_pda_account.to_info(),
+                f.token_prog.to_info(), f.clock.to_info(), f.pyth_index.to_info()
+            ];
+            let res = process_instruction(&f.program_id, &accounts, &encode_withdraw(0, 201));
+            assert_eq!(res, Err(ProgramError::InvalidInstructionData), "Misaligned withdrawal should be rejected");
+        }
+
+        // Withdraw 200 (aligned) - should succeed
+        {
+            let accounts = vec![
+                f.admin.to_info(), f.slab.to_info(), f.vault.to_info(), user_ata.to_info(),
+                vault_pda_account.to_info(),
+                f.token_prog.to_info(), f.clock.to_info(), f.pyth_index.to_info()
+            ];
+            // This will fail for other reasons (token transfer in test), but not InvalidInstructionData
+            let res = process_instruction(&f.program_id, &accounts, &encode_withdraw(0, 200));
+            assert_ne!(res, Err(ProgramError::InvalidInstructionData), "Aligned withdrawal should not fail on alignment");
         }
     }
 }
