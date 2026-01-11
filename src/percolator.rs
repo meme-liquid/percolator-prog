@@ -44,13 +44,12 @@ pub mod constants {
     /// unit_scale=1..=1_000_000_000 enables scaling with dust tracking.
     pub const MAX_UNIT_SCALE: u32 = 1_000_000_000;
 
-    // Inventory-mark funding constants (Option 2)
-    // Funding is computed on-chain from LP inventory + oracle price
-    pub const FUNDING_HORIZON_SLOTS: u64 = 500;            // ~4 min @ ~2 slots/sec
-    pub const FUNDING_K_BPS: u64 = 100;                    // 1.00x multiplier
-    pub const FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // 1M USDC notional in e6
-    pub const FUNDING_MAX_PREMIUM_BPS: i64 = 500;          // cap premium at 5.00%
-    pub const FUNDING_MAX_BPS_PER_SLOT: i64 = 5;           // cap per-slot funding
+    // Default funding parameters (used at init_market, can be changed via update_config)
+    pub const DEFAULT_FUNDING_HORIZON_SLOTS: u64 = 500;            // ~4 min @ ~2 slots/sec
+    pub const DEFAULT_FUNDING_K_BPS: u64 = 100;                    // 1.00x multiplier
+    pub const DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6: u128 = 1_000_000_000_000; // 1M USDC notional in e6
+    pub const DEFAULT_FUNDING_MAX_PREMIUM_BPS: i64 = 500;          // cap premium at 5.00%
+    pub const DEFAULT_FUNDING_MAX_BPS_PER_SLOT: i64 = 5;           // cap per-slot funding
 
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
@@ -78,23 +77,15 @@ pub mod constants {
     pub const RET_OFF_ORACLE_PRICE: usize = 48;
     pub const RET_OFF_RESERVED: usize = 56;
 
-    // Auto-threshold policy constants
-    /// Base floor for risk_reduction_threshold (can be 0 for demo)
-    pub const THRESH_FLOOR: u128 = 0;
-    /// BPS of risk metric for threshold calculation (50 = 0.50%)
-    pub const THRESH_RISK_BPS: u64 = 50;
-    /// Minimum slots between threshold updates (prevents churn)
-    pub const THRESH_UPDATE_INTERVAL_SLOTS: u64 = 10;
-    /// Maximum BPS change in threshold per update (step clamp)
-    pub const THRESH_STEP_BPS: u64 = 500; // 5%
-    /// EWMA alpha in BPS (higher = faster response, 1000 = 10% new value)
-    pub const THRESH_ALPHA_BPS: u64 = 1000;
-    /// Minimum threshold value
-    pub const THRESH_MIN: u128 = 0;
-    /// Maximum threshold value (cap to prevent overflow)
-    pub const THRESH_MAX: u128 = 10_000_000_000_000_000_000u128;
-    /// Minimum step size to avoid churn on tiny changes
-    pub const THRESH_MIN_STEP: u128 = 1;
+    // Default threshold parameters (used at init_market, can be changed via update_config)
+    pub const DEFAULT_THRESH_FLOOR: u128 = 0;
+    pub const DEFAULT_THRESH_RISK_BPS: u64 = 50;              // 0.50%
+    pub const DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS: u64 = 10;
+    pub const DEFAULT_THRESH_STEP_BPS: u64 = 500;             // 5% max step
+    pub const DEFAULT_THRESH_ALPHA_BPS: u64 = 1000;           // 10% EWMA
+    pub const DEFAULT_THRESH_MIN: u128 = 0;
+    pub const DEFAULT_THRESH_MAX: u128 = 10_000_000_000_000_000_000u128;
+    pub const DEFAULT_THRESH_MIN_STEP: u128 = 1;
 }
 
 // 1b. Risk metric helpers (pure functions for anti-DoS threshold calculation)
@@ -183,13 +174,16 @@ fn compute_net_lp_pos(engine: &percolator::RiskEngine) -> i128 {
 /// Policy: rate sign follows LP inventory sign to push net_lp_pos toward 0.
 ///   - If LP net long (net_lp_pos > 0), rate > 0 => longs pay => discourages longs => pushes inventory toward 0.
 ///   - If LP net short (net_lp_pos < 0), rate < 0 => shorts pay => discourages shorts => pushes inventory toward 0.
-pub fn compute_inventory_funding_bps_per_slot(net_lp_pos: i128, price_e6: u64) -> i64 {
-    use crate::constants::{
-        FUNDING_HORIZON_SLOTS, FUNDING_K_BPS, FUNDING_INV_SCALE_NOTIONAL_E6,
-        FUNDING_MAX_PREMIUM_BPS, FUNDING_MAX_BPS_PER_SLOT
-    };
-
-    if net_lp_pos == 0 || price_e6 == 0 {
+pub fn compute_inventory_funding_bps_per_slot(
+    net_lp_pos: i128,
+    price_e6: u64,
+    funding_horizon_slots: u64,
+    funding_k_bps: u64,
+    funding_inv_scale_notional_e6: u128,
+    funding_max_premium_bps: i64,
+    funding_max_bps_per_slot: i64,
+) -> i64 {
+    if net_lp_pos == 0 || price_e6 == 0 || funding_horizon_slots == 0 {
         return 0;
     }
 
@@ -198,11 +192,11 @@ pub fn compute_inventory_funding_bps_per_slot(net_lp_pos: i128, price_e6: u64) -
 
     // premium_bps = (notional / scale) * k_bps, capped
     let mut premium_bps_u: u128 = notional_e6
-        .saturating_mul(FUNDING_K_BPS as u128)
-        / FUNDING_INV_SCALE_NOTIONAL_E6;
+        .saturating_mul(funding_k_bps as u128)
+        / funding_inv_scale_notional_e6.max(1);
 
-    if premium_bps_u > (FUNDING_MAX_PREMIUM_BPS.unsigned_abs() as u128) {
-        premium_bps_u = FUNDING_MAX_PREMIUM_BPS.unsigned_abs() as u128;
+    if premium_bps_u > (funding_max_premium_bps.unsigned_abs() as u128) {
+        premium_bps_u = funding_max_premium_bps.unsigned_abs() as u128;
     }
 
     // Apply sign: if LP net long (net_lp_pos > 0), funding is positive
@@ -213,14 +207,14 @@ pub fn compute_inventory_funding_bps_per_slot(net_lp_pos: i128, price_e6: u64) -
     };
 
     // Convert to per-slot by dividing by horizon
-    let mut per_slot: i64 = signed_premium_bps / (FUNDING_HORIZON_SLOTS as i64);
+    let mut per_slot: i64 = signed_premium_bps / (funding_horizon_slots as i64);
 
     // Sanity clamp: absolute max ±10000 bps/slot (100% per slot) to catch overflow bugs
     per_slot = per_slot.clamp(-10_000, 10_000);
 
-    // Policy clamp: tighter bound per constants
-    if per_slot > FUNDING_MAX_BPS_PER_SLOT { per_slot = FUNDING_MAX_BPS_PER_SLOT; }
-    if per_slot < -FUNDING_MAX_BPS_PER_SLOT { per_slot = -FUNDING_MAX_BPS_PER_SLOT; }
+    // Policy clamp: tighter bound per config
+    if per_slot > funding_max_bps_per_slot { per_slot = funding_max_bps_per_slot; }
+    if per_slot < -funding_max_bps_per_slot { per_slot = -funding_max_bps_per_slot; }
     per_slot
 }
 
@@ -977,6 +971,7 @@ pub mod error {
         EngineAccountKindMismatch,
         InvalidTokenAccount,
         InvalidTokenProgram,
+        InvalidConfigParam,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1039,6 +1034,22 @@ pub mod ix {
         /// Close the market slab and recover SOL to admin.
         /// Requires: no active accounts, no vault funds, no insurance funds.
         CloseSlab,
+        /// Update configurable parameters (funding + threshold). Admin only.
+        UpdateConfig {
+            funding_horizon_slots: u64,
+            funding_k_bps: u64,
+            funding_inv_scale_notional_e6: u128,
+            funding_max_premium_bps: i64,
+            funding_max_bps_per_slot: i64,
+            thresh_floor: u128,
+            thresh_risk_bps: u64,
+            thresh_update_interval_slots: u64,
+            thresh_step_bps: u64,
+            thresh_alpha_bps: u64,
+            thresh_min: u128,
+            thresh_max: u128,
+            thresh_min_step: u128,
+        },
     }
 
     impl Instruction {
@@ -1120,6 +1131,27 @@ pub mod ix {
                 13 => { // CloseSlab
                     Ok(Instruction::CloseSlab)
                 },
+                14 => { // UpdateConfig
+                    let funding_horizon_slots = read_u64(&mut rest)?;
+                    let funding_k_bps = read_u64(&mut rest)?;
+                    let funding_inv_scale_notional_e6 = read_u128(&mut rest)?;
+                    let funding_max_premium_bps = read_i64(&mut rest)?;
+                    let funding_max_bps_per_slot = read_i64(&mut rest)?;
+                    let thresh_floor = read_u128(&mut rest)?;
+                    let thresh_risk_bps = read_u64(&mut rest)?;
+                    let thresh_update_interval_slots = read_u64(&mut rest)?;
+                    let thresh_step_bps = read_u64(&mut rest)?;
+                    let thresh_alpha_bps = read_u64(&mut rest)?;
+                    let thresh_min = read_u128(&mut rest)?;
+                    let thresh_max = read_u128(&mut rest)?;
+                    let thresh_min_step = read_u128(&mut rest)?;
+                    Ok(Instruction::UpdateConfig {
+                        funding_horizon_slots, funding_k_bps, funding_inv_scale_notional_e6,
+                        funding_max_premium_bps, funding_max_bps_per_slot,
+                        thresh_floor, thresh_risk_bps, thresh_update_interval_slots,
+                        thresh_step_bps, thresh_alpha_bps, thresh_min, thresh_max, thresh_min_step,
+                    })
+                },
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -1150,6 +1182,13 @@ pub mod ix {
         let (bytes, rest) = input.split_at(8);
         *input = rest;
         Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
+    fn read_i64(input: &mut &[u8]) -> Result<i64, ProgramError> {
+        if input.len() < 8 { return Err(ProgramError::InvalidInstructionData); }
+        let (bytes, rest) = input.split_at(8);
+        *input = rest;
+        Ok(i64::from_le_bytes(bytes.try_into().unwrap()))
     }
 
     fn read_i128(input: &mut &[u8]) -> Result<i128, ProgramError> {
@@ -1279,8 +1318,6 @@ pub mod state {
     pub struct MarketConfig {
         pub collateral_mint: [u8; 32],
         pub vault_pubkey: [u8; 32],
-        /// Reserved for future use (was collateral_oracle, unused)
-        pub _reserved: [u8; 32],
         /// Pyth feed ID for the index price feed
         pub index_feed_id: [u8; 32],
         /// Maximum staleness in seconds (Pyth Pull uses unix timestamps)
@@ -1292,6 +1329,40 @@ pub mod state {
         /// Lamports per Unit for conversion (e.g., 1000 means 1 SOL = 1,000,000 Units)
         /// If 0, no scaling is applied (1:1 lamports to units)
         pub unit_scale: u32,
+
+        // ========================================
+        // Funding Parameters (configurable)
+        // ========================================
+        /// Funding horizon in slots (~4 min at 500 slots)
+        pub funding_horizon_slots: u64,
+        /// Funding rate multiplier in basis points (100 = 1.00x)
+        pub funding_k_bps: u64,
+        /// Inverse scale notional in e6 (1e12 = $1M)
+        pub funding_inv_scale_notional_e6: u128,
+        /// Max premium in basis points (500 = 5%)
+        pub funding_max_premium_bps: i64,
+        /// Max funding rate per slot in basis points
+        pub funding_max_bps_per_slot: i64,
+
+        // ========================================
+        // Threshold Parameters (configurable)
+        // ========================================
+        /// Floor for threshold calculation
+        pub thresh_floor: u128,
+        /// Risk coefficient in basis points (50 = 0.5%)
+        pub thresh_risk_bps: u64,
+        /// Update interval in slots
+        pub thresh_update_interval_slots: u64,
+        /// Max step size in basis points (500 = 5%)
+        pub thresh_step_bps: u64,
+        /// EWMA alpha in basis points (1000 = 10%)
+        pub thresh_alpha_bps: u64,
+        /// Minimum threshold value
+        pub thresh_min: u128,
+        /// Maximum threshold value
+        pub thresh_max: u128,
+        /// Minimum step size
+        pub thresh_min_step: u128,
     }
 
     pub fn slab_data_mut<'a, 'b>(ai: &'b AccountInfo<'a>) -> Result<RefMut<'b, &'a mut [u8]>, ProgramError> {
@@ -1687,6 +1758,32 @@ pub mod oracle {
 
         Ok(inverted as u64)
     }
+
+    /// Read the raw oracle price in e6, WITHOUT inversion.
+    /// Used for funding calculation which needs USD-denominated notional.
+    pub fn read_raw_price_e6(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
+        conf_bps: u16,
+    ) -> Result<u64, ProgramError> {
+        // Detect oracle type by account owner and dispatch
+        if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
+            read_pyth_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)
+        } else if *price_ai.owner == CHAINLINK_OCR2_PROGRAM_ID {
+            read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)
+        } else {
+            #[cfg(feature = "test")]
+            {
+                read_pyth_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)
+            }
+            #[cfg(not(feature = "test"))]
+            {
+                Err(ProgramError::IllegalOwner)
+            }
+        }
+    }
 }
 
 // 9. mod collateral
@@ -1790,7 +1887,8 @@ pub mod processor {
         state::{self, SlabHeader, MarketConfig},
         accounts,
         constants::{MAGIC, VERSION, SLAB_LEN, CONFIG_LEN, MATCHER_CONTEXT_LEN, MATCHER_CALL_TAG, MATCHER_CALL_LEN, MATCHER_CONTEXT_PREFIX_LEN,
-            THRESH_FLOOR, THRESH_RISK_BPS, THRESH_UPDATE_INTERVAL_SLOTS, THRESH_STEP_BPS, THRESH_ALPHA_BPS, THRESH_MIN, THRESH_MAX, THRESH_MIN_STEP},
+            DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6, DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+            DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS, DEFAULT_THRESH_STEP_BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_MIN, DEFAULT_THRESH_MAX, DEFAULT_THRESH_MIN_STEP},
         error::{PercolatorError, map_risk_error},
         oracle,
         collateral,
@@ -2014,13 +2112,27 @@ pub mod processor {
                 let config = MarketConfig {
                     collateral_mint: a_mint.key.to_bytes(),
                     vault_pubkey: a_vault.key.to_bytes(),
-                    _reserved: [0; 32],
                     index_feed_id,
                     max_staleness_secs,
                     conf_filter_bps,
                     vault_authority_bump: bump,
                     invert,
                     unit_scale,
+                    // Funding parameters (defaults)
+                    funding_horizon_slots: DEFAULT_FUNDING_HORIZON_SLOTS,
+                    funding_k_bps: DEFAULT_FUNDING_K_BPS,
+                    funding_inv_scale_notional_e6: DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
+                    funding_max_premium_bps: DEFAULT_FUNDING_MAX_PREMIUM_BPS,
+                    funding_max_bps_per_slot: DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+                    // Threshold parameters (defaults)
+                    thresh_floor: DEFAULT_THRESH_FLOOR,
+                    thresh_risk_bps: DEFAULT_THRESH_RISK_BPS,
+                    thresh_update_interval_slots: DEFAULT_THRESH_UPDATE_INTERVAL_SLOTS,
+                    thresh_step_bps: DEFAULT_THRESH_STEP_BPS,
+                    thresh_alpha_bps: DEFAULT_THRESH_ALPHA_BPS,
+                    thresh_min: DEFAULT_THRESH_MIN,
+                    thresh_max: DEFAULT_THRESH_MAX,
+                    thresh_min_step: DEFAULT_THRESH_MIN_STEP,
                 };
                 state::write_config(&mut data, &config);
 
@@ -2302,8 +2414,26 @@ pub mod processor {
                 // Compute inventory-based funding rate from LP net position.
                 // Engine internally gates same-slot compounding via dt = now_slot - last_funding_slot,
                 // so passing the same rate multiple times in the same slot is harmless (dt=0 => no change).
+                //
+                // IMPORTANT: Use raw (non-inverted) oracle price for funding calculation.
+                // Funding notional must be USD-denominated regardless of market invert setting.
+                let raw_price = oracle::read_raw_price_e6(
+                    a_oracle,
+                    &config.index_feed_id,
+                    clock.unix_timestamp,
+                    config.max_staleness_secs,
+                    config.conf_filter_bps,
+                )?;
                 let net_lp_pos = crate::compute_net_lp_pos(engine);
-                let effective_funding_rate = crate::compute_inventory_funding_bps_per_slot(net_lp_pos, price);
+                let effective_funding_rate = crate::compute_inventory_funding_bps_per_slot(
+                    net_lp_pos,
+                    raw_price,  // Use raw price, not inverted
+                    config.funding_horizon_slots,
+                    config.funding_k_bps,
+                    config.funding_inv_scale_notional_e6,
+                    config.funding_max_premium_bps,
+                    config.funding_max_bps_per_slot,
+                );
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
@@ -2337,33 +2467,33 @@ pub mod processor {
                 let ins_low = engine.insurance_fund.balance as u64;
 
                 // --- Threshold auto-update (rate-limited + EWMA smoothed + step-clamped)
-                if clock.slot >= last_thr_slot.saturating_add(THRESH_UPDATE_INTERVAL_SLOTS) {
+                if clock.slot >= last_thr_slot.saturating_add(config.thresh_update_interval_slots) {
                     let risk_units = crate::compute_system_risk_units(engine);
                     // Convert risk_units (contracts) to notional using price
                     let risk_notional = risk_units
                         .saturating_mul(price as u128)
                         / 1_000_000;
-                    // raw target: floor + risk_notional * THRESH_RISK_BPS / 10000
-                    let raw_target = THRESH_FLOOR
+                    // raw target: floor + risk_notional * thresh_risk_bps / 10000
+                    let raw_target = config.thresh_floor
                         .saturating_add(
                             risk_notional
-                                .saturating_mul(THRESH_RISK_BPS as u128)
+                                .saturating_mul(config.thresh_risk_bps as u128)
                                 / 10_000
                         );
-                    let clamped_target = raw_target.clamp(THRESH_MIN, THRESH_MAX);
+                    let clamped_target = raw_target.clamp(config.thresh_min, config.thresh_max);
                     let current = engine.risk_reduction_threshold();
                     // EWMA: new = alpha * target + (1 - alpha) * current
-                    let alpha = THRESH_ALPHA_BPS as u128;
+                    let alpha = config.thresh_alpha_bps as u128;
                     let smoothed = (alpha * clamped_target + (10_000 - alpha) * current) / 10_000;
-                    // Step clamp: max step = THRESH_STEP_BPS / 10000 of current (but at least THRESH_MIN_STEP)
-                    let max_step = (current * THRESH_STEP_BPS as u128 / 10_000)
-                        .max(THRESH_MIN_STEP);
+                    // Step clamp: max step = thresh_step_bps / 10000 of current (but at least thresh_min_step)
+                    let max_step = (current * config.thresh_step_bps as u128 / 10_000)
+                        .max(config.thresh_min_step);
                     let final_thresh = if smoothed > current {
                         current.saturating_add(max_step.min(smoothed - current))
                     } else {
                         current.saturating_sub(max_step.min(current - smoothed))
                     };
-                    engine.set_risk_reduction_threshold(final_thresh.clamp(THRESH_MIN, THRESH_MAX));
+                    engine.set_risk_reduction_threshold(final_thresh.clamp(config.thresh_min, config.thresh_max));
                     drop(engine);
                     state::write_last_thr_update_slot(&mut data, clock.slot);
                 }
@@ -2886,6 +3016,58 @@ pub mod processor {
                     .lamports()
                     .checked_add(slab_lamports)
                     .ok_or(PercolatorError::EngineOverflow)?;
+            }
+
+            Instruction::UpdateConfig {
+                funding_horizon_slots, funding_k_bps, funding_inv_scale_notional_e6,
+                funding_max_premium_bps, funding_max_bps_per_slot,
+                thresh_floor, thresh_risk_bps, thresh_update_interval_slots,
+                thresh_step_bps, thresh_alpha_bps, thresh_min, thresh_max, thresh_min_step,
+            } => {
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Validate parameters
+                if funding_horizon_slots == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                if funding_inv_scale_notional_e6 == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                if thresh_alpha_bps > 10_000 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+                if thresh_min > thresh_max {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
+
+                // Read existing config and update
+                let mut config = state::read_config(&data);
+                config.funding_horizon_slots = funding_horizon_slots;
+                config.funding_k_bps = funding_k_bps;
+                config.funding_inv_scale_notional_e6 = funding_inv_scale_notional_e6;
+                config.funding_max_premium_bps = funding_max_premium_bps;
+                config.funding_max_bps_per_slot = funding_max_bps_per_slot;
+                config.thresh_floor = thresh_floor;
+                config.thresh_risk_bps = thresh_risk_bps;
+                config.thresh_update_interval_slots = thresh_update_interval_slots;
+                config.thresh_step_bps = thresh_step_bps;
+                config.thresh_alpha_bps = thresh_alpha_bps;
+                config.thresh_min = thresh_min;
+                config.thresh_max = thresh_max;
+                config.thresh_min_step = thresh_min_step;
+                state::write_config(&mut data, &config);
             }
         }
         Ok(())

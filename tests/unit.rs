@@ -868,7 +868,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
 
     #[test]
     fn test_crank_updates_threshold_from_risk_metric() {
-        use percolator_prog::constants::{THRESH_FLOOR, THRESH_RISK_BPS, THRESH_ALPHA_BPS, THRESH_MIN_STEP, THRESH_STEP_BPS};
+        use percolator_prog::constants::{DEFAULT_THRESH_FLOOR, DEFAULT_THRESH_RISK_BPS, DEFAULT_THRESH_ALPHA_BPS, DEFAULT_THRESH_MIN_STEP, DEFAULT_THRESH_STEP_BPS};
 
         let mut f = setup_market();
         let init_data = encode_init_market(&f, 100);
@@ -1257,21 +1257,38 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         // Uses large positions (100B contracts at $100 = $10T notional) to ensure
         // the premium hits the cap (500 bps) and per_slot is non-zero (1 bps).
 
+        use percolator_prog::constants::{
+            DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
+            DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+        };
+
         // Test the pure compute function directly
         let price_e6 = 100_000_000u64; // $100
 
         // LP net long => positive funding rate (longs pay)
         // 100B contracts at $100 = $10T notional, saturates to 500 bps cap, /500 = 1 bps/slot
         let net_long: i128 = 100_000_000_000;
-        let rate_long = percolator_prog::compute_inventory_funding_bps_per_slot(net_long, price_e6);
+        let rate_long = percolator_prog::compute_inventory_funding_bps_per_slot(
+            net_long, price_e6,
+            DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
+            DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+        );
 
         // LP net short => negative funding rate (shorts pay)
         let net_short: i128 = -100_000_000_000;
-        let rate_short = percolator_prog::compute_inventory_funding_bps_per_slot(net_short, price_e6);
+        let rate_short = percolator_prog::compute_inventory_funding_bps_per_slot(
+            net_short, price_e6,
+            DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
+            DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+        );
 
         // LP flat => zero funding rate
         let net_flat: i128 = 0;
-        let rate_flat = percolator_prog::compute_inventory_funding_bps_per_slot(net_flat, price_e6);
+        let rate_flat = percolator_prog::compute_inventory_funding_bps_per_slot(
+            net_flat, price_e6,
+            DEFAULT_FUNDING_HORIZON_SLOTS, DEFAULT_FUNDING_K_BPS, DEFAULT_FUNDING_INV_SCALE_NOTIONAL_E6,
+            DEFAULT_FUNDING_MAX_PREMIUM_BPS, DEFAULT_FUNDING_MAX_BPS_PER_SLOT,
+        );
 
         // Verify rates are actually non-zero for large positions
         assert!(rate_long > 0, "LP net long with large position should give positive rate, got {}", rate_long);
