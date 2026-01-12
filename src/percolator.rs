@@ -718,6 +718,24 @@ pub mod verify {
         Some(inverted as u64)
     }
 
+    /// Scale oracle price by unit_scale: scaled_e6 = price_e6 / unit_scale
+    /// Returns None if result would be zero (price too small for scale).
+    ///
+    /// CRITICAL: This ensures oracle-derived values (entry_price, mark_pnl, position_value)
+    /// are in the same scale as capital (which is stored in units via base_to_units).
+    /// Without this scaling, margin checks would compare units to base tokens incorrectly.
+    #[inline]
+    pub fn scale_price_e6(price: u64, unit_scale: u32) -> Option<u64> {
+        if unit_scale <= 1 {
+            return Some(price);
+        }
+        let scaled = price / unit_scale as u64;
+        if scaled == 0 {
+            return None;
+        }
+        Some(scaled)
+    }
+
     // =========================================================================
     // Unit scale conversion math (pure logic)
     // =========================================================================
@@ -794,6 +812,7 @@ pub mod verify {
     pub fn init_market_scale_ok(unit_scale: u32) -> bool {
         unit_scale <= crate::constants::MAX_UNIT_SCALE
     }
+
 }
 
 // 2. mod zc (Zero-Copy unsafe island)
@@ -1705,16 +1724,21 @@ pub mod oracle {
         Ok(final_price_u128 as u64)
     }
 
-    /// Read oracle price for engine use, applying inversion if configured.
+    /// Read oracle price for engine use, applying inversion and unit scaling if configured.
     ///
     /// Automatically detects oracle type by account owner:
     /// - PYTH_RECEIVER_PROGRAM_ID: reads Pyth PriceUpdateV2
     /// - CHAINLINK_OCR2_PROGRAM_ID: reads Chainlink OCR2 Transmissions
     ///
-    /// If invert == 0: returns raw oracle price_e6
-    /// If invert != 0: returns inverted price = 1e12 / raw_e6
+    /// Transformations applied in order:
+    /// 1. If invert != 0: inverted price = 1e12 / raw_e6
+    /// 2. If unit_scale > 1: scaled price = price / unit_scale
     ///
-    /// The raw oracle is validated (staleness, confidence for Pyth) BEFORE inversion.
+    /// CRITICAL: The unit_scale transformation ensures oracle-derived values (entry_price,
+    /// mark_pnl, position_value) are in the same scale as capital (which is stored in units).
+    /// Without this scaling, margin checks would compare units to base tokens incorrectly.
+    ///
+    /// The raw oracle is validated (staleness, confidence for Pyth) BEFORE transformations.
     pub fn read_engine_price_e6(
         price_ai: &AccountInfo,
         expected_feed_id: &[u8; 32],
@@ -1722,6 +1746,7 @@ pub mod oracle {
         max_staleness_secs: u64,
         conf_bps: u16,
         invert: u8,
+        unit_scale: u32,
     ) -> Result<u64, ProgramError> {
         // Detect oracle type by account owner and dispatch
         let raw_price = if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
@@ -1740,23 +1765,14 @@ pub mod oracle {
             }
         };
 
-        if invert == 0 {
-            return Ok(raw_price);
-        }
-
-        // Invert: inverted_e6 = 1e12 / raw_e6
-        let inverted = (1_000_000_000_000u128)
-            .checked_div(raw_price as u128)
+        // Step 1: Apply inversion if configured (uses verify::invert_price_e6)
+        let price_after_invert = crate::verify::invert_price_e6(raw_price, invert)
             .ok_or(PercolatorError::OracleInvalid)?;
 
-        if inverted == 0 {
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-        if inverted > u64::MAX as u128 {
-            return Err(PercolatorError::EngineOverflow.into());
-        }
-
-        Ok(inverted as u64)
+        // Step 2: Apply unit scaling if configured (uses verify::scale_price_e6)
+        // This ensures oracle-derived values match capital scale (stored in units)
+        crate::verify::scale_price_e6(price_after_invert, unit_scale)
+            .ok_or(PercolatorError::OracleInvalid.into())
     }
 }
 
@@ -2286,6 +2302,7 @@ pub mod processor {
                     config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
+                    config.unit_scale,
                 )?;
 
                 // Reject misaligned withdrawal amounts (cleaner UX than silent floor)
@@ -2380,6 +2397,7 @@ pub mod processor {
                     config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
+                    config.unit_scale,
                 )?;
                 // Execute crank with effective_caller_idx for clarity
                 // In permissionless mode, pass CRANK_NO_CALLER to engine (out-of-range = no caller settle)
@@ -2523,6 +2541,7 @@ pub mod processor {
                     config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
+                    config.unit_scale,
                 )?;
 
                 // Gate: if insurance_fund <= threshold, only allow risk-reducing trades
@@ -2653,7 +2672,7 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(a_clock)?;
-                // Use engine price (with inversion if configured)
+                // Use engine price (with inversion and unit scaling if configured)
                 let price = oracle::read_engine_price_e6(
                     a_oracle,
                     &config.index_feed_id,
@@ -2661,6 +2680,7 @@ pub mod processor {
                     config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
+                    config.unit_scale,
                 )?;
 
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
@@ -2780,7 +2800,7 @@ pub mod processor {
                 check_idx(engine, target_idx)?;
 
                 let clock = Clock::from_account_info(&accounts[2])?;
-                // Use engine price (with inversion if configured)
+                // Use engine price (with inversion and unit scaling if configured)
                 let price = oracle::read_engine_price_e6(
                     a_oracle,
                     &config.index_feed_id,
@@ -2788,6 +2808,7 @@ pub mod processor {
                     config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
+                    config.unit_scale,
                 )?;
 
                 #[cfg(feature = "cu-audit")]
@@ -2838,7 +2859,7 @@ pub mod processor {
                 }
 
                 let clock = Clock::from_account_info(&accounts[6])?;
-                // Use engine price (with inversion if configured)
+                // Use engine price (with inversion and unit scaling if configured)
                 let price = oracle::read_engine_price_e6(
                     a_oracle,
                     &config.index_feed_id,
@@ -2846,6 +2867,7 @@ pub mod processor {
                     config.max_staleness_secs,
                     config.conf_filter_bps,
                     config.invert,
+                    config.unit_scale,
                 )?;
 
                 #[cfg(feature = "cu-audit")]
