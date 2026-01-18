@@ -2228,12 +2228,13 @@ pub mod processor {
                 engine.set_owner(idx, a_user.key.to_bytes()).map_err(map_risk_error)?;
             },
             Instruction::DepositCollateral { user_idx, amount } => {
-                accounts::expect_len(accounts, 5)?;
+                accounts::expect_len(accounts, 6)?;
                 let a_user = &accounts[0];
                 let a_slab = &accounts[1];
                 let a_user_ata = &accounts[2];
                 let a_vault = &accounts[3];
                 let a_token = &accounts[4];
+                let a_clock = &accounts[5];
 
                 accounts::expect_signer(a_user)?;
                 accounts::expect_writable(a_slab)?;
@@ -2248,6 +2249,8 @@ pub mod processor {
                 let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
                 verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
                 verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+                let clock = Clock::from_account_info(a_clock)?;
 
                 // Transfer base tokens to vault
                 collateral::deposit(a_token, a_user_ata, a_vault, a_user, amount)?;
@@ -2269,7 +2272,7 @@ pub mod processor {
                     return Err(PercolatorError::EngineUnauthorized.into());
                 }
 
-                engine.deposit(user_idx, units as u128).map_err(map_risk_error)?;
+                engine.deposit(user_idx, units as u128, clock.slot).map_err(map_risk_error)?;
             },
             Instruction::WithdrawCollateral { user_idx, amount } => {
                 accounts::expect_len(accounts, 8)?;
