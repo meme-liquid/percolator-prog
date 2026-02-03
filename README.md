@@ -351,3 +351,15 @@ cargo test
 
 # Kani harnesses (requires kani toolchain)
 cargo kani --tests
+```
+
+---
+
+## Devnet Deployments
+
+| Program | Address |
+|---------|---------|
+| Percolator | `46iB4ET4WpqfTXAqGSmyBczLBgVhd1sHre93KtU3sTg9` |
+| vAMM Matcher | `4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy` |
+
+These addresses are deployed on Solana **devnet**.
