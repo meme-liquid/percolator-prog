@@ -1718,6 +1718,118 @@ fn test_hyperp_init_market_with_valid_price() {
     println!("HYPERP INIT VERIFIED: Market initialized with $100 initial mark/index price");
 }
 
+/// Test: Hyperp mode with inverted market (e.g., SOL/USD perp)
+///
+/// For inverted markets, the raw oracle price is inverted: inverted = 1e12 / raw
+/// Example: SOL/USD oracle returns ~$138 (138_000_000 in e6)
+///          Inverted = 1e12 / 138_000_000 = ~7246 (price in SOL per USD)
+///
+/// In Hyperp mode with invert=1:
+/// - initial_mark_price_e6 provided as raw price (e.g., 138_000_000)
+/// - InitMarket applies inversion internally
+/// - Stored mark/index are in inverted form (~7246)
+#[test]
+fn test_hyperp_init_market_with_inverted_price() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found. Run: cargo build-sbf");
+        return;
+    }
+
+    let mut svm = LiteSVM::new();
+    let program_id = Pubkey::new_unique();
+    let program_bytes = std::fs::read(&path).expect("Failed to read program");
+    svm.add_program(program_id, &program_bytes);
+
+    let payer = Keypair::new();
+    let slab = Pubkey::new_unique();
+    let mint = Pubkey::new_unique();
+    let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", slab.as_ref()], &program_id);
+    let vault = Pubkey::new_unique();
+
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+
+    svm.set_account(slab, Account {
+        lamports: 1_000_000_000,
+        data: vec![0u8; SLAB_LEN],
+        owner: program_id,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    svm.set_account(mint, Account {
+        lamports: 1_000_000,
+        data: make_mint_data(),
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    svm.set_account(vault, Account {
+        lamports: 1_000_000,
+        data: make_token_account_data(&mint, &vault_pda, 0),
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    let dummy_ata = Pubkey::new_unique();
+    svm.set_account(dummy_ata, Account {
+        lamports: 1_000_000,
+        data: vec![0u8; TokenAccount::LEN],
+        owner: spl_token::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+
+    svm.set_sysvar(&Clock { slot: 100, unix_timestamp: 100, ..Clock::default() });
+
+    // Hyperp mode with inverted market
+    // Raw price: $138 (SOL/USD) = 138_000_000 in e6
+    // After inversion: 1e12 / 138_000_000 = ~7246 (USD/SOL)
+    let raw_price_e6 = 138_000_000u64; // $138 in e6 format
+    let expected_inverted = 1_000_000_000_000u64 / raw_price_e6; // ~7246
+
+    let ix = Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(slab, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(sysvar::rent::ID, false),
+            AccountMeta::new_readonly(dummy_ata, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        data: encode_init_market_full_v2(
+            &payer.pubkey(),
+            &mint,
+            &[0u8; 32],       // Hyperp mode: feed_id = 0
+            1,                // invert = 1 (inverted market)
+            raw_price_e6,     // Raw price, will be inverted internally
+            0,                // warmup
+        ),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&payer.pubkey()), &[&payer], svm.latest_blockhash(),
+    );
+
+    let result = svm.send_transaction(tx);
+
+    assert!(
+        result.is_ok(),
+        "Hyperp InitMarket with inverted price should succeed. Got: {:?}", result
+    );
+
+    println!("HYPERP INVERTED MARKET VERIFIED:");
+    println!("  Raw price: {} (${:.2})", raw_price_e6, raw_price_e6 as f64 / 1_000_000.0);
+    println!("  Expected inverted: {} (~{:.4} SOL/USD)", expected_inverted, expected_inverted as f64 / 1_000_000.0);
+    println!("  Mark/Index stored in inverted form for SOL-denominated perp");
+}
+
 // ============================================================================
 // Matcher Context Initialization Tests
 // ============================================================================

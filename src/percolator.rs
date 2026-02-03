@@ -2315,6 +2315,15 @@ pub mod processor {
                     return Err(ProgramError::InvalidInstructionData);
                 }
 
+                // For Hyperp mode with inverted markets, apply inversion to initial price
+                // This ensures the stored mark/index are in "market price" form
+                let initial_mark_price_e6 = if is_hyperp && invert != 0 {
+                    crate::verify::invert_price_e6(initial_mark_price_e6, invert)
+                        .ok_or(PercolatorError::OracleInvalid)?
+                } else {
+                    initial_mark_price_e6
+                };
+
                 #[cfg(debug_assertions)]
                 {
                     if core::mem::size_of::<MarketConfig>() != CONFIG_LEN {
