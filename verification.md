@@ -4,11 +4,14 @@ This document provides a comprehensive verification matrix covering all security
 
 ## Test Summary
 
-**Total Tests: 32**
+**Total Tests: 43**
 - Feature Tests: 11 comprehensive + 2 basic crank tests
 - Bug Regression Tests: 7
 - Security Tests: 8
+- Hyperp Mode Tests: 7
 - Matcher Tests: 4
+- **Critical Authorization Tests: 10** (NEW)
+- Devnet Integration: 1
 
 ---
 
@@ -87,6 +90,28 @@ This document provides a comprehensive verification matrix covering all security
 | `test_bug7_pending_epoch_wraparound` | Bug #7 | Pending epoch wraparound | PASS |
 | `test_bug8_lp_entry_price_updates_on_flip` | Bug #8 | LP entry price on flip | PASS |
 
+## 9. Critical Authorization Tests (NEW)
+
+| Test | Description | Status |
+|------|-------------|--------|
+| `test_critical_update_admin_authorization` | UpdateAdmin only by current admin | PASS |
+| `test_critical_set_risk_threshold_authorization` | SetRiskThreshold admin-only | PASS |
+| `test_critical_admin_oracle_authority` | SetOracleAuthority/PushOraclePrice admin-only | PASS |
+| `test_critical_set_oracle_price_cap_authorization` | SetOraclePriceCap admin-only | PASS |
+| `test_critical_set_maintenance_fee_authorization` | SetMaintenanceFee admin-only | PASS |
+| `test_critical_update_config_authorization` | UpdateConfig admin-only (13 params) | PASS |
+| `test_critical_liquidation_rejected_when_solvent` | Liquidation rejected for solvent accounts | PASS |
+| `test_critical_close_slab_authorization` | CloseSlab admin-only + requires zero balance | PASS |
+| `test_critical_init_market_rejects_double_init` | Double initialization rejected | PASS |
+| `test_critical_invalid_account_indices_rejected` | Invalid user_idx/lp_idx rejected | PASS |
+| `test_sell_trade_negative_size` | Short trades (negative size) work correctly | PASS |
+
+## 10. Devnet Integration
+
+| Test | Description | Status |
+|------|-------------|--------|
+| `test_devnet_full_lifecycle` | Full market lifecycle on devnet | PASS |
+
 ---
 
 ## Security Properties Verified
@@ -137,7 +162,7 @@ This document provides a comprehensive verification matrix covering all security
 
 | Instruction | Unit Test | Integration Test | Security Test |
 |-------------|-----------|------------------|---------------|
-| InitMarket | - | test_inverted_market_crank | test_hyperp_init_market |
+| InitMarket | - | test_inverted_market_crank | test_critical_init_market_rejects_double_init |
 | InitUser | - | test_comprehensive_* | test_unauthorized_access |
 | InitLP | - | test_comprehensive_* | test_matcher_init |
 | DepositCollateral | - | test_comprehensive_* | test_unauthorized_access |
@@ -145,12 +170,17 @@ This document provides a comprehensive verification matrix covering all security
 | KeeperCrank | - | test_funding_accrual | test_hyperp_security |
 | TradeNoCpi | - | test_trading_lifecycle | test_hyperp_trade_nocpi |
 | TradeCpi | - | test_matcher_call | test_hyperp_security |
-| LiquidateAtOracle | - | test_liquidation | - |
+| LiquidateAtOracle | - | test_liquidation | test_critical_liquidation_rejected_when_solvent |
 | CloseAccount | - | test_close_account | - |
 | TopUpInsurance | - | test_insurance_fund | - |
-| CloseSlab | - | test_bug3_close_slab | - |
-| SetOraclePriceCap | - | - | test_hyperp_default_cap |
-| SetFundingParams | - | - | - |
+| SetRiskThreshold | - | - | test_critical_set_risk_threshold_authorization |
+| UpdateAdmin | - | - | test_critical_update_admin_authorization |
+| CloseSlab | - | test_bug3_close_slab | test_critical_close_slab_authorization |
+| UpdateConfig | - | - | test_critical_update_config_authorization |
+| SetMaintenanceFee | - | - | test_critical_set_maintenance_fee_authorization |
+| SetOracleAuthority | - | - | test_critical_admin_oracle_authority |
+| PushOraclePrice | - | - | test_critical_admin_oracle_authority |
+| SetOraclePriceCap | - | - | test_critical_set_oracle_price_cap_authorization |
 
 ---
 

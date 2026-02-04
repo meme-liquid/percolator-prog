@@ -357,9 +357,42 @@ cargo kani --tests
 
 ## Devnet Deployments
 
+### Programs
+
 | Program | Address |
 |---------|---------|
 | Percolator | `46iB4ET4WpqfTXAqGSmyBczLBgVhd1sHre93KtU3sTg9` |
 | vAMM Matcher | `4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy` |
+
+### Test Market (SOL Perp)
+
+| Account | Address |
+|---------|---------|
+| Market Slab | `AcF3Q3UMHqx2xZR2Ty6pNvfCaogFmsLEqyMACQ2c4UPK` |
+| Vault | `D7QrsrJ4emtsw5LgPGY2coM5K9WPPVgQNJVr5TbK7qtU` |
+| Vault PDA | `37ofUw9TgFqqU4nLJcJLUg7L4GhHYRuJLHU17EXMPVi9` |
+| Matcher Context | `Gspp8GZtHhYR1kWsZ9yMtAhMiPXk5MF9sRdRrSycQJio` |
+| Collateral | Native SOL (wrapped) |
+
+### Test Market Configuration
+
+- **Maintenance margin**: 5% (500 bps)
+- **Initial margin**: 10% (1000 bps)
+- **Trading fee**: 0.1% (10 bps)
+- **Liquidation fee**: 0.5% (50 bps)
+- **Admin Oracle**: Prices pushed via `PushOraclePrice` instruction
+
+### Using the Devnet Market
+
+1. **Create user account**: Call `InitUser` with your wallet
+2. **Deposit collateral**: Call `DepositCollateral` with wrapped SOL
+3. **Trade**: Call `TradeNoCpi` with LP index 0 and your user index
+4. **Check state**: Run `KeeperCrank` permissionlessly
+
+Example with admin oracle (for testing):
+```bash
+# Run devnet integration test
+cargo test --test devnet_test -- --nocapture --ignored
+```
 
 These addresses are deployed on Solana **devnet**.
