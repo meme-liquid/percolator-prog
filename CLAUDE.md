@@ -12,7 +12,16 @@ Percolator is a perpetual futures protocol deployed on Solana. It consists of tw
 | Program | Address |
 |---------|---------|
 | Percolator | `46iB4ET4WpqfTXAqGSmyBczLBgVhd1sHre93KtU3sTg9` |
-| vAMM Matcher | `4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Lfzy` |
+| vAMM Matcher | `4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy` |
+
+## Test Market (Devnet)
+
+| Account | Address |
+|---------|---------|
+| Market Slab | `AcF3Q3UMHqx2xZR2Ty6pNvfCaogFmsLEqyMACQ2c4UPK` |
+| Vault | `D7QrsrJ4emtsw5LgPGY2coM5K9WPPVgQNJVr5TbK7qtU` |
+| Vault PDA | `37ofUw9TgFqqU4nLJcJLUg7L4GhHYRuJLHU17EXMPVi9` |
+| Matcher Context | `Gspp8GZtHhYR1kWsZ9yMtAhMiPXk5MF9sRdRrSycQJio` |
 
 ## Architecture
 
@@ -85,14 +94,14 @@ Percolator is a perpetual futures protocol deployed on Solana. It consists of tw
 | 4 | WithdrawCollateral | Remove collateral (margin checked) |
 | 5 | KeeperCrank | Maintenance: funding, fees, liquidations |
 | 6 | TradeNoCpi | Direct trade (disabled for Hyperp) |
-| 7 | TradeCpi | Trade via LP matcher |
+| 7 | LiquidateAtOracle | Liquidate underwater account |
 | 8 | CloseAccount | Close and withdraw remaining capital |
 | 9 | TopUpInsurance | Add to insurance fund |
-| 10 | LiquidateAtOracle | Liquidate underwater account |
-| 11 | UpdateAdmin | Rotate admin key |
-| 12 | SetRiskThreshold | Set risk reduction threshold |
+| 10 | TradeCpi | Trade via LP matcher CPI |
+| 11 | SetRiskThreshold | Set risk reduction threshold |
+| 12 | UpdateAdmin | Rotate admin key |
 | 13 | CloseSlab | Close market (admin only) |
-| 14 | SetFundingParams | Configure funding rate |
+| 14 | UpdateConfig | Configure funding and threshold params |
 | 15 | SetMaintenanceFee | Set per-slot maintenance fee |
 | 16 | SetOracleAuthority | Set admin oracle authority |
 | 17 | PushOraclePrice | Push price (authority only) |
@@ -100,7 +109,7 @@ Percolator is a perpetual futures protocol deployed on Solana. It consists of tw
 
 ## Testing
 
-### Local Integration Tests (32 tests)
+### Local Integration Tests (43 tests)
 ```bash
 cargo test --test integration
 ```
@@ -108,6 +117,11 @@ cargo test --test integration
 ### Devnet Test (requires funded wallet)
 ```bash
 cargo test --test devnet_test -- --ignored --nocapture
+```
+
+### Devnet Stress Test
+```bash
+cargo test --test devnet_test test_devnet_stress -- --ignored --nocapture
 ```
 
 ### Build BPF
@@ -133,10 +147,10 @@ percolator-prog/
 ├── src/
 │   └── percolator.rs      # Main program (3500+ lines)
 ├── tests/
-│   ├── integration.rs     # 32 LiteSVM tests
-│   └── devnet_test.rs     # Live devnet test
+│   ├── integration.rs     # 43 LiteSVM tests
+│   └── devnet_test.rs     # Live devnet + stress tests
 ├── README.md              # High-level documentation
-├── verification.md        # Test matrix
+├── verification.md        # Test matrix (43 tests)
 ├── audit.md               # Security audit notes
 └── CLAUDE.md              # This file
 ```

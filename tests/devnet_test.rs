@@ -634,3 +634,216 @@ fn test_devnet_full_lifecycle() {
     println!("Vault: {}", vault.pubkey());
     println!("Matcher context: {}", matcher_ctx.pubkey());
 }
+
+/// Stress test against existing devnet market
+/// Run: cargo test --test devnet_test test_devnet_stress -- --nocapture --ignored
+#[test]
+#[ignore]
+fn test_devnet_stress() {
+    println!("\n=== DEVNET STRESS TEST ===\n");
+
+    let client = get_rpc_client();
+    let payer = load_keypair();
+    let program_id = Pubkey::from_str(PERCOLATOR_PROGRAM_ID).unwrap();
+
+    println!("Payer: {}", payer.pubkey());
+    println!("Program: {}", program_id);
+
+    // Get balance
+    let balance = client.get_balance(&payer.pubkey()).unwrap();
+    println!("Balance: {} SOL\n", balance as f64 / 1_000_000_000.0);
+
+    if balance < 100_000_000 {
+        println!("ERROR: Insufficient balance for stress test (need at least 0.1 SOL)");
+        return;
+    }
+
+    // Use existing market from previous test
+    // These addresses are from the test_devnet_full_lifecycle run
+    let slab = Pubkey::from_str("AcF3Q3UMHqx2xZR2Ty6pNvfCaogFmsLEqyMACQ2c4UPK").unwrap();
+    let pyth_account = Pubkey::from_str(PYTH_SOL_USD_FEED).unwrap();
+
+    println!("Slab: {}", slab);
+    println!("Oracle: {}\n", pyth_account);
+
+    // Verify slab exists
+    match client.get_account(&slab) {
+        Ok(acc) => {
+            println!("Slab account found: {} bytes, owner: {}", acc.data.len(), acc.owner);
+            if acc.owner != program_id {
+                println!("ERROR: Slab owner mismatch");
+                return;
+            }
+        }
+        Err(e) => {
+            println!("ERROR: Slab not found: {:?}", e);
+            println!("Run test_devnet_full_lifecycle first to create the market");
+            return;
+        }
+    }
+
+    // === STRESS TEST: Multiple Cranks ===
+    println!("\n--- Stress Test: Multiple Cranks ---");
+    let mut crank_success = 0;
+    let mut crank_fail = 0;
+    let crank_count = 10;
+
+    for i in 0..crank_count {
+        let crank_ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(sysvar::clock::id(), false),
+                AccountMeta::new_readonly(pyth_account, false),
+            ],
+            data: encode_crank(),
+        };
+
+        let blockhash = client.get_latest_blockhash().unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[crank_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            blockhash,
+        );
+
+        match client.send_and_confirm_transaction(&tx) {
+            Ok(sig) => {
+                crank_success += 1;
+                println!("Crank {}/{}: {} SUCCESS", i + 1, crank_count, &sig.to_string()[..16]);
+            }
+            Err(e) => {
+                crank_fail += 1;
+                println!("Crank {}/{}: FAILED - {:?}", i + 1, crank_count, e);
+            }
+        }
+
+        // Small delay between transactions
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    println!("\nCrank results: {} success, {} failed out of {}", crank_success, crank_fail, crank_count);
+
+    // === STRESS TEST: Oracle Price Updates ===
+    println!("\n--- Stress Test: Oracle Price Updates ---");
+    let prices = [130_000_000u64, 135_000_000, 140_000_000, 145_000_000, 138_000_000];
+    let mut price_success = 0;
+    let mut price_fail = 0;
+
+    for (i, &price) in prices.iter().enumerate() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let push_price_ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            data: encode_push_oracle_price(price, now),
+        };
+
+        let blockhash = client.get_latest_blockhash().unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[push_price_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            blockhash,
+        );
+
+        match client.send_and_confirm_transaction(&tx) {
+            Ok(sig) => {
+                price_success += 1;
+                println!("Price {}/{}: ${:.2} - {} SUCCESS",
+                    i + 1, prices.len(), price as f64 / 1_000_000.0, &sig.to_string()[..16]);
+            }
+            Err(e) => {
+                price_fail += 1;
+                println!("Price {}/{}: ${:.2} FAILED - {:?}",
+                    i + 1, prices.len(), price as f64 / 1_000_000.0, e);
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    println!("\nPrice update results: {} success, {} failed out of {}", price_success, price_fail, prices.len());
+
+    // === STRESS TEST: Rapid Crank After Price Changes ===
+    println!("\n--- Stress Test: Rapid Crank Sequence ---");
+    let rapid_count = 5;
+    let mut rapid_success = 0;
+
+    for i in 0..rapid_count {
+        // Push price
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let price = 130_000_000 + (i as u64 * 5_000_000); // $130, $135, $140, $145, $150
+
+        let push_price_ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(slab, false),
+            ],
+            data: encode_push_oracle_price(price, now),
+        };
+
+        // Crank immediately after
+        let crank_ix = Instruction {
+            program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(slab, false),
+                AccountMeta::new_readonly(sysvar::clock::id(), false),
+                AccountMeta::new_readonly(pyth_account, false),
+            ],
+            data: encode_crank(),
+        };
+
+        let blockhash = client.get_latest_blockhash().unwrap();
+        let tx = Transaction::new_signed_with_payer(
+            &[push_price_ix, crank_ix],
+            Some(&payer.pubkey()),
+            &[&payer],
+            blockhash,
+        );
+
+        match client.send_and_confirm_transaction(&tx) {
+            Ok(sig) => {
+                rapid_success += 1;
+                println!("Rapid {}/{}: Price ${:.0} + Crank - {} SUCCESS",
+                    i + 1, rapid_count, price as f64 / 1_000_000.0, &sig.to_string()[..16]);
+            }
+            Err(e) => {
+                println!("Rapid {}/{}: FAILED - {:?}", i + 1, rapid_count, e);
+            }
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+
+    println!("\nRapid sequence results: {} success out of {}", rapid_success, rapid_count);
+
+    // === Summary ===
+    println!("\n=== STRESS TEST SUMMARY ===");
+    println!("Cranks: {}/{} successful", crank_success, crank_count);
+    println!("Price Updates: {}/{} successful", price_success, prices.len());
+    println!("Rapid Sequences: {}/{} successful", rapid_success, rapid_count);
+
+    let total_ops = crank_count + prices.len() + rapid_count;
+    let total_success = crank_success + price_success + rapid_success;
+    println!("\nTotal: {}/{} operations successful ({:.1}%)",
+        total_success, total_ops, (total_success as f64 / total_ops as f64) * 100.0);
+
+    if total_success == total_ops {
+        println!("\n✓ STRESS TEST PASSED: All operations completed successfully");
+    } else {
+        println!("\n⚠ STRESS TEST PARTIAL: Some operations failed");
+    }
+}
