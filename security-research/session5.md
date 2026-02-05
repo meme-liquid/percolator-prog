@@ -3349,12 +3349,138 @@ All critical arithmetic uses appropriate safety:
 
 ---
 
-## COMPREHENSIVE SECURITY RESEARCH COMPLETE (Sessions 5-19)
+## Session 20: Dust and Edge Case Deep Dive
+
+**Date**: 2026-02-05
+**Focus**: Rounding, dust accumulation, and edge case attack vectors
+
+#### 227. Position Value Rounding to Zero ✓
+**Location**: `percolator/src/percolator.rs` (margin checks)
+**Status**: SECURE
+
+Hypothesis: Very small positions might round to zero value, bypassing margin checks.
+
+Analysis:
+- Margin checks verify `position != 0` explicitly
+- Position sizes tracked in contract units, not dollar value
+- Zero position allowed only when no margin required
+- Dust positions still have position != 0
+
+**Finding**: Position existence checked, not just value
+
+#### 228. Dust Ceiling Division ✓
+**Location**: `percolator/src/percolator.rs:2784-2785`
+**Status**: SECURE
+
+Hypothesis: Ceiling division in base_to_units might be exploitable.
+
+Analysis:
+- Formula: `(base + unit_scale - 1) / unit_scale`
+- Remainder goes to dust_base accumulator
+- Dust swept to insurance when >= unit_scale
+- Attacker pays ceiling, dust benefits protocol
+
+**Finding**: Conservative rounding favors protocol
+
+#### 229. Fee Credit Manipulation ✓
+**Location**: `percolator/src/percolator.rs:1049-1067`
+**Status**: SECURE (Intentional Design)
+
+Hypothesis: Fee credits might be exploitable for free maintenance.
+
+Analysis:
+- Credits start at 0
+- Maintenance fees charged: credit -= fee_per_slot × dt
+- Can go negative (debt)
+- Paid from capital on settlement
+- Forgiven on close_account
+
+**Finding**: Credits only benefit user briefly; ultimately paid
+
+#### 230. Close Account Edge Cases ✓
+**Location**: `percolator-prog/src/percolator.rs:3197-3248`
+**Status**: SECURE
+
+Edge cases analyzed:
+- Close with zero capital: Allowed (no lamports transferred)
+- Close with negative PnL: Rejected (requires pnl == 0)
+- Close with fee debt: Forgiven after paying what's possible
+- Close with warmup: settle_warmup_to_capital called first
+
+**Finding**: Proper ordering and guards for all edge cases
+
+#### 231. Minimum Position Size ✓
+**Location**: `percolator/src/percolator.rs` (trade execution)
+**Status**: SECURE
+
+Analysis:
+- No minimum position size enforced
+- Very small trades still charge fees
+- Dust goes to insurance fund
+- Margin requirements still apply
+
+**Finding**: Small trades uneconomical but not exploitable
+
+#### 232. Minimum Price Edge Cases ✓
+**Location**: `percolator/src/percolator.rs` (oracle handling)
+**Status**: SECURE
+
+Analysis:
+- oracle_price_e6 must be > 0 (explicit check)
+- exec_price_e6 must be > 0 (explicit check)
+- Division by price protected by zero check
+- Notional > 0 required for trades
+
+**Finding**: All price paths have zero guards
+
+#### 233. LP Aggregate Atomicity ✓
+**Location**: `percolator/src/percolator.rs` (execute_trade)
+**Status**: SECURE (Solana Atomicity)
+
+Hypothesis: LP aggregates might desync if instruction fails mid-execution.
+
+Analysis:
+- LP.c_tot, LP.pnl_pos_tot updated in execute_trade
+- Aggregates updated before CPI return
+- Solana atomicity: instruction failure reverts ALL state changes
+- No partial state possible
+
+**Finding**: Transaction atomicity protects aggregate consistency
+
+#### 234. Haircut Stability at Zero ✓
+**Location**: `percolator/src/percolator.rs` (compute_haircut_ratio)
+**Status**: SECURE
+
+Hypothesis: Edge case when pnl_pos_tot = 0.
+
+Analysis:
+- If pnl_pos_tot == 0, haircut = 0 (no profits to haircut)
+- Explicit zero check before division
+- Returns E18_ONE (full haircut) when residual >= pnl_pos_tot
+- Returns min(residual, pnl_pos_tot) / pnl_pos_tot otherwise
+
+**Finding**: Zero case explicitly handled
+
+## Session 20 Summary
+
+**Edge Cases Analyzed**: 8
+**Critical Vulnerabilities Found**: 0
+**Design Confirmations**: 3 (fee credits, atomicity, conservative rounding)
+
+All dust and edge case handling is robust with:
+- Explicit zero checks throughout
+- Conservative rounding favoring protocol
+- Solana atomicity protecting state consistency
+- Proper ordering in cleanup operations
+
+---
+
+## COMPREHENSIVE SECURITY RESEARCH COMPLETE (Sessions 5-20)
 
 ### Final Statistics
 
-**Total Sessions**: 15 (Sessions 5-19)
-**Total Areas Verified**: 226
+**Total Sessions**: 16 (Sessions 5-20)
+**Total Areas Verified**: 234
 **Critical Vulnerabilities Found**: 0
 **Open Issues**: 0
 
@@ -3375,13 +3501,14 @@ All critical arithmetic uses appropriate safety:
 | Authorization | 6 | ✓ VERIFIED |
 | TradeCpi Layers | 4 | ✓ VERIFIED |
 | Novel Attack Vectors | 20+ | ✓ TESTED |
+| Dust/Edge Cases | 8 | ✓ VERIFIED |
 
 ### Verification Methods
 
 - 271 Kani formal proofs
 - 57 integration tests (all pass)
 - 21 proptest fuzzing tests
-- Manual code review (226 areas)
+- Manual code review (234 areas)
 - Novel attack hypothesis testing (20+ vectors)
 
 ### Conclusion
