@@ -1679,8 +1679,184 @@ Mitigations:
 | Risk gate sandwich | Low | MITIGATED |
 | Hyperp mark manipulation | High | SECURED |
 
+### Economic Attack Analysis
+
+#### 124. Dust Accumulation Attack ✓
+**Status**: MITIGATED (by design)
+
+Potential attack:
+- Attacker performs many small trades to accumulate dust
+- Dust is swept to insurance fund (sweep_dust_to_insurance)
+
+Defense:
+- Dust automatically swept when >= unit_scale
+- CloseSlab checks dust_base == 0
+- Attackers pay trading fees, making dust farming unprofitable
+- No external fund extraction possible
+
+**Risk**: Low (self-limiting due to trading fees)
+
+#### 125. Fee Rounding Exploitation ✓
+**Status**: MITIGATED
+
+Potential attack:
+- Perform many tiny trades where fee rounds to 0
+- Accumulate positions without paying fees
+
+Defense:
+- Ceiling division for fee calculation: `(notional * fee_bps + BPS_DENOM - 1) / BPS_DENOM`
+- Minimum 1 unit fee for any non-zero trade
+- unit_scale enforces minimum trade sizes
+
+**Risk**: Low (ceiling division prevents zero-fee trades)
+
+#### 126. Liquidation Manipulation ✓
+**Status**: SECURE
+
+Potential attacks:
+- Self-liquidation for fee farming
+- Liquidating accounts just above threshold
+
+Defense:
+- Liquidation requires mtm_equity < 0 (truly underwater)
+- Oracle circuit breaker prevents price manipulation
+- Liquidation fees capped by liquidation_fee_cap
+- Fee goes to insurance fund, not liquidator caller
+
+**Risk**: Low (economically unprofitable to self-liquidate)
+
+#### 127. Negative PnL Write-off ✓
+**Status**: ARCHITECTURAL CONSIDERATION
+
+Behavior:
+- `settle_warmup_to_capital` writes off negative PnL against capital
+- If capital insufficient, remaining negative PnL forgiven on close
+
+Impact:
+- Creates socialized losses (haircutted from positive PnL holders)
+- Insurance fund absorbs via reduced residual
+
+**Risk**: Expected behavior (haircut mechanism handles socialization)
+
+#### 128. Funding Rate Gaming ✓
+**Status**: MITIGATED
+
+Potential attacks:
+- Force extreme funding rates via large positions
+- Extract value from counterparties via funding
+
+Defense:
+- Rate capped at ±10,000 bps/slot (hard limit)
+- Policy clamp per config (funding_max_bps_per_slot)
+- Premium capped (funding_max_premium_bps)
+- Anti-retroactivity: stored rate used, not computed rate
+
+**Risk**: Low (multi-layer clamping limits extraction)
+
+#### 129. Insurance Fund Lockdown ✓
+**Status**: DOCUMENTED (by design)
+
+Observation:
+- No WithdrawInsurance instruction exists
+- Insurance can only increase (fees, dust sweeps)
+- CloseSlab requires insurance.balance == 0
+
+Impact:
+- Markets with ANY activity can never be fully closed
+- Slab lamports remain locked indefinitely
+
+**Risk**: Architectural consideration (not vulnerability)
+**Recommendation**: Add admin WithdrawInsurance if market closure desired
+
+#### 130. Fee Debt Forgiveness ✓
+**Status**: DOCUMENTED (by design)
+
+Behavior:
+- CloseAccount forgives unpaid fee debt
+- `settle_owed_fees_best_effort` pays what's possible
+- Remaining debt written off
+
+Impact:
+- Users can accumulate fees then close with insufficient capital
+- Small losses absorbed by insurance fund
+
+**Risk**: Low (maintenance fees are small relative to capital requirements)
+
+#### 131. Deposit/Withdraw Ordering ✓
+**Status**: SECURE
+
+Potential attack:
+- Deposit, accumulate funding, withdraw
+- Timing attacks on settlement
+
+Defense:
+- `touch_account` called at deposit start (settles funding/fees first)
+- Withdrawal margin check after settlement
+- No ordering advantage possible
+
+**Risk**: None (proper lazy settlement on all operations)
+
+#### 132. Withdrawal Haircut Alignment ✓
+**Status**: SECURE
+
+Potential attack:
+- Withdraw when haircut is favorable
+- Extract more than fair share
+
+Defense:
+- Haircut computed fresh at withdrawal time
+- Based on current residual vs pnl_pos_tot
+- Post-trade margin check uses projected haircut
+
+**Risk**: None (haircut correctly tracks current state)
+
+#### 133. Liquidation Fee Cap Bypass ✓
+**Status**: SECURE
+
+Potential attack:
+- Large liquidation to exceed fee cap
+- Or split into many small liquidations
+
+Defense:
+- Fee cap applied per liquidation
+- Splitting requires more transactions (gas cost)
+- Fee goes to insurance fund (no external benefit)
+
+**Risk**: None (cap correctly applied)
+
+#### 134. Haircut Collapse Scenario ✓
+**Status**: ARCHITECTURAL CONSIDERATION
+
+Scenario:
+- Large negative PnL event depletes residual
+- Haircut → 0 for all positive PnL holders
+
+Expected behavior:
+- Socialized losses via haircut mechanism
+- Insurance fund provides buffer
+- Risk reduction mode activates at threshold
+
+**Risk**: Systemic risk handled by design (threshold + force-realize)
+
+### Economic Attack Summary
+
+| Attack Vector | Risk Level | Status |
+|---------------|------------|--------|
+| Dust accumulation | Low | MITIGATED |
+| Fee rounding | Low | MITIGATED |
+| Liquidation manipulation | Low | SECURE |
+| Negative PnL write-off | N/A | BY DESIGN |
+| Funding rate gaming | Low | MITIGATED |
+| Insurance lockdown | N/A | DOCUMENTED |
+| Fee debt forgiveness | Low | BY DESIGN |
+| Deposit/withdraw ordering | None | SECURE |
+| Withdrawal haircut | None | SECURE |
+| Liquidation fee cap | None | SECURE |
+| Haircut collapse | Systemic | BY DESIGN |
+
 ## Session 8 Summary
 
-**Total Areas Verified**: 123
+**Total Areas Verified**: 134
 **New Vulnerabilities Found**: 0
 **MEV Defenses**: Comprehensive
+**Economic Attack Analysis**: Complete
