@@ -360,29 +360,150 @@ Body must include:
 Each cycle (manual or automated) is:
 
 1) `git pull --rebase`
-2) `cargo build-sbf`
-3) Run all deterministic tests:
-   - `cargo test --test integration`
-   - `cargo test --test integration_security_oracle`
-   - `cargo test --test integration_security_margin`
-   - ...
-4) Run seeded property sequences:
-   - fixed seeds (baseline)
-   - rotating seeds (logged only to `research/`)
-5) If any invariant fails:
-   - minimize
-   - classify
-   - only promote to committed test if it meets "legit" criteria
+2) **SKIP re-running passing tests** - only run tests if code changed
+3) **Focus on NOVEL attack vector research** (see next section)
+4) Write NEW targeted tests for unexplored edge cases
+5) Document hypotheses and findings in `research/journal/`
 
 You must keep a daily journal entry in:
 - `research/journal/YYYY-MM-DD.md` (gitignored)
 
 Include:
-- what you tested
-- configs covered
-- seeds run
-- hypotheses explored
-- suspected issues (clearly marked "UNCONFIRMED")
+- Novel attack vectors explored (not repeat analysis)
+- New hypotheses generated
+- Edge cases discovered
+- Combination attacks attempted
+
+---
+
+# Novel Attack Vector Research (S-Tier Focus)
+
+**DO NOT** repeatedly verify areas already confirmed secure.
+**DO** focus on creative, unexplored attack surfaces.
+
+## Phase 1: Combination Attacks
+
+Explore attacks that combine multiple components:
+
+1. **Oracle + Margin + Liquidation Chain**
+   - Can oracle manipulation trigger cascading liquidations?
+   - Can a user self-liquidate profitably via oracle timing?
+   - What if oracle flips sign during a multi-step trade?
+
+2. **Funding + Warmup + Haircut Interaction**
+   - Can funding payments bypass warmup restrictions?
+   - Can haircut ratio be manipulated before warmup conversion?
+   - What if warmup completes mid-crank during force-realize?
+
+3. **TradeCpi + Risk Gate + Insurance Depletion**
+   - Can a user trigger risk gate activation to grief others?
+   - Can insurance be depleted faster than threshold updates?
+   - What if matcher returns edge-case exec_size during gate transition?
+
+## Phase 2: Adversarial State Construction
+
+Craft specific state configurations to break invariants:
+
+1. **Extreme Position Distributions**
+   - All users long, single LP short at MAX_POSITION_ABS
+   - Alternating +1/-1 positions across all 4096 accounts
+   - Single account with position = MAX, rest at 0
+
+2. **Boundary Value Combinations**
+   - capital = 1, position = MAX, price at MAX_ORACLE_PRICE
+   - pnl_pos_tot near u128::MAX, residual near 0
+   - insurance = threshold - 1, trigger edge
+
+3. **Degenerate Market Configs**
+   - warmup_period = 1 slot, margin_bps = 1
+   - max_crank_staleness = 0 vs u64::MAX
+   - unit_scale at MAX_UNIT_SCALE with tiny prices
+
+## Phase 3: Temporal/Ordering Attacks
+
+Find bugs through instruction sequencing:
+
+1. **Rapid State Transitions**
+   - Deposit → Trade → Withdraw in single transaction
+   - Multiple position flips in consecutive slots
+   - Force-realize during partial position close
+
+2. **Crank Race Conditions**
+   - User trade immediately after crank starts but before their account processed
+   - Liquidation attempt during active crank sweep
+   - Threshold update racing with trade execution
+
+3. **Cross-Slot State Leakage**
+   - State set in slot N, exploited in slot N+1 before crank
+   - Oracle price changes between trade submission and execution
+   - Funding rate computed with stale positions
+
+## Phase 4: Economic/Game-Theoretic Exploits
+
+Find profitable manipulation strategies:
+
+1. **Griefing Attacks**
+   - Minimum-cost DOS on specific users
+   - Forcing others into unfavorable liquidations
+   - Blocking market closure via dust/insurance
+
+2. **Value Extraction**
+   - Arbitrage between mark and index in Hyperp
+   - Exploiting rounding in fee calculations
+   - Gaming warmup timing for profit
+
+3. **Collusion Scenarios**
+   - LP + User coordinated extraction
+   - Multiple accounts same owner gaming aggregates
+   - Admin + LP collusion vectors
+
+## Phase 5: Write Targeted Exploit Tests
+
+For each hypothesis, write a SPECIFIC test that:
+1. Constructs the exact adversarial state
+2. Executes the attack sequence
+3. Checks if invariants are violated
+4. Documents expected vs actual behavior
+
+Example test pattern:
+```rust
+#[test]
+fn exploit_haircut_warmup_race() {
+    // Hypothesis: Can haircut be computed with stale warmup state?
+    // Setup: User A has large positive PnL in warmup
+    // Attack: Crank processes User B first, reducing residual
+    // Check: User A's warmup conversion uses updated haircut
+}
+```
+
+## Phase 6: Formal Invariant Probing
+
+Define and test protocol invariants that MUST hold:
+
+1. **Conservation**: vault >= c_tot + insurance + sum(positive_pnl * haircut)
+2. **Margin Safety**: No position exists with equity < required_margin (post-crank)
+3. **Aggregate Consistency**: c_tot == sum(capitals), pnl_pos_tot == sum(max(pnl, 0))
+4. **LP Protection**: LP cannot be forced to take unbounded losses
+5. **Atomicity**: No partial state visible across transaction boundaries
+
+For EACH invariant, construct adversarial sequences attempting to violate it.
+
+## Anti-Patterns (What NOT to do)
+
+- ❌ Re-verify areas marked SECURE in session5.md
+- ❌ Re-run integration tests without code changes
+- ❌ Repeat the same exploration agents with same prompts
+- ❌ Document "verified secure" for already-verified areas
+- ❌ Count areas verified as progress metric
+
+## Progress Metrics (What DOES count)
+
+- ✅ Novel hypotheses generated and tested
+- ✅ New edge-case tests written
+- ✅ Combination attacks explored
+- ✅ Adversarial states constructed and probed
+- ✅ Economic exploits analyzed
+- ✅ Bugs found (even if minor)
 
 ---
 
