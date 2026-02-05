@@ -2387,3 +2387,179 @@ TradeCpi validates:
 **New Vulnerabilities Found**: 0
 **Authorization Security**: All 6 vectors defended
 **Instruction Sequence Security**: All 5 vectors defended
+
+---
+
+## Session 12 (2026-02-05 continued)
+
+### Oracle Fallback & Degradation Analysis
+
+#### 169. Three-Tier Oracle System ✓
+**Status**: SECURE (comprehensive fallback)
+
+Tiers:
+1. External (Pyth/Chainlink) - staleness + confidence checks
+2. Authority (Admin) - admin-pushed with circuit breaker
+3. Hyperp (Internal) - mark/index with rate limiting
+
+Fallback order: Authority → External (in read_price_with_authority)
+
+**Risk**: Low (proper degradation handling)
+
+#### 170. Oracle Staleness Checks ✓
+**Location**: `percolator-prog/src/percolator.rs:1659-1665, 1758-1764`
+**Status**: SECURE (mainnet), DISABLED (devnet)
+
+- Pyth: age = now - publish_time, must be <= max_staleness_secs
+- Chainlink: same pattern with timestamp
+- **Warning**: devnet feature disables checks
+
+**Risk**: None on mainnet (proper staleness enforcement)
+
+#### 171. Pyth Confidence Filter ✓
+**Location**: `percolator-prog/src/percolator.rs:1671-1673`
+**Status**: SECURE
+
+Constraint: `confidence * 10000 <= price * conf_bps`
+- Rejects prices with wide confidence intervals
+- Chainlink has NO confidence filter (OCR2 doesn't report it)
+
+**Risk**: Low (tight bounds prevent manipulation)
+
+#### 172. Authority Timestamp Handling ✓
+**Location**: `percolator-prog/src/percolator.rs:3510`
+**Status**: DOCUMENTED CONSIDERATION
+
+- Timestamp not validated (can be any i64)
+- Admin can push past/future timestamps
+- Staleness check applies but admin controls input
+
+**Risk**: Low (admin-only, operational discipline required)
+
+#### 173. Circuit Breaker First-Time ✓
+**Location**: `percolator-prog/src/percolator.rs:1898`
+**Status**: DESIGN CHOICE
+
+- First price accepted without clamping (last_price == 0)
+- Subsequent prices clamped against first
+- InitMarket should set trusted initial price
+
+**Risk**: Low (admin-controlled initialization)
+
+#### 174. Hyperp Mark Continuity ✓
+**Status**: SECURE
+
+- TradeCpi updates mark via clamped exec_price
+- TradeNoCpi blocked in Hyperp (line 2842-2846)
+- Index smooths toward mark at capped rate (Bug #9 fixed)
+
+**Risk**: None (continuous mark updates via TradeCpi)
+
+### Input Validation Analysis
+
+#### 175. Instruction Data Length Checks ✓
+**Location**: `percolator-prog/src/percolator.rs:1220-1279`
+**Status**: SECURE
+
+All read_* functions validate length before parsing:
+- read_u8/u16/u32/u64/i64/u128/i128/pubkey/bytes32
+- All return InvalidInstructionData on truncated input
+
+**Risk**: None (comprehensive length validation)
+
+#### 176. Instruction Tag Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:1097-1217`
+**Status**: SECURE
+
+- Tags 0-18 explicitly matched
+- Catch-all returns InvalidInstructionData
+- Invalid tags rejected
+
+**Risk**: None (proper enum handling)
+
+#### 177. Account Structure Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:2156-2243`
+**Status**: SECURE
+
+- Account count validated via expect_len
+- Slab ownership verified (program-owned)
+- Slab data length validated (new + old layouts)
+- Token accounts: owner, mint, initialization
+
+**Risk**: None (comprehensive validation)
+
+#### 178. RiskParams Validation ✓
+**Status**: ADMIN RESPONSIBILITY
+
+**Note**: RiskParams not validated during InitMarket:
+- maintenance_margin_bps, initial_margin_bps unbounded
+- max_accounts unbounded (but check_idx enforces MAX_ACCOUNTS)
+- trading_fee_bps unbounded
+
+**Mitigation**: Admin-only initialization, saturating arithmetic prevents overflow
+- Engine functions enforce MAX_ACCOUNTS = 4096 via check_idx
+- Margin = 0 would allow undercollateralized positions (admin misconfiguration)
+
+**Risk**: Low (admin misconfiguration only, not exploitable by users)
+
+#### 179. Unit Scale Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:2313-2316`
+**Status**: SECURE
+
+- init_market_scale_ok: unit_scale <= MAX_UNIT_SCALE (1B)
+- unit_scale = 0 allowed (disables scaling)
+- Withdrawal alignment check enforces unit boundaries
+
+**Risk**: None (proper bounds)
+
+#### 180. Account Index Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:2193-2198`
+**Status**: SECURE
+
+- check_idx: idx < MAX_ACCOUNTS AND is_used(idx)
+- u16::MAX → rejected (>= MAX_ACCOUNTS)
+- All trade/deposit/withdraw/liquidate use check_idx
+
+**Risk**: None (comprehensive index bounds)
+
+#### 181. Matcher ABI Validation ✓
+**Location**: `percolator-prog/src/percolator.rs:916-964`
+**Status**: SECURE (very thorough)
+
+Validates:
+- ABI version, flags (VALID, REJECTED)
+- exec_price != 0
+- exec_size direction and magnitude
+- Echoed fields: lp_account_id, oracle_price, req_id
+- Reserved bytes must be 0
+
+**Risk**: None (Kani-proven validation)
+
+### Oracle Fallback Summary
+
+| Scenario | Outcome | Defense |
+|----------|---------|---------|
+| Pyth stale | Fallback to authority | Staleness check |
+| Authority unavailable | Fallback to Pyth | Priority ordering |
+| Both unavailable | Trades fail | Graceful rejection |
+| Hyperp mark=0 | OracleInvalid error | Validation check |
+| First-time circuit breaker | Accepts any price | Design choice |
+
+### Input Validation Summary
+
+| Input Category | Status | Notes |
+|----------------|--------|-------|
+| Instruction length | SECURE | All read_* check bounds |
+| Instruction tags | SECURE | Catch-all rejection |
+| Account structure | SECURE | Ownership + length + init |
+| RiskParams | ADMIN | Unbounded but admin-only |
+| Unit scale | SECURE | MAX_UNIT_SCALE enforced |
+| Account indices | SECURE | check_idx everywhere |
+| Matcher ABI | SECURE | Kani-proven |
+
+## Session 12 Summary
+
+**Total Areas Verified**: 181
+**New Vulnerabilities Found**: 0
+**Oracle Fallback**: Comprehensive three-tier system
+**Input Validation**: Strong, with admin-responsibility patterns
