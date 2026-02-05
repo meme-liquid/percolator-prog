@@ -1136,9 +1136,32 @@ The Percolator codebase demonstrates excellent security practices across all rev
 - Staleness check (age > max_staleness_secs)
 - Price cleared on authority change (SetOracleAuthority)
 
+#### 87. Circuit Breaker (clamp_oracle_price) ✓
+**Location**: `percolator-prog/src/percolator.rs:1894-1905`
+**Status**: SECURE
+
+- Clamps raw_price to ±max_change from last_price
+- Returns raw_price if cap=0 (disabled) or last_price=0 (first-time)
+- Uses saturating_sub/saturating_add for bounds
+- Applied consistently across all oracle reads
+- Updates last_effective_price after clamping
+
+#### 88. Inventory Funding Rate ✓
+**Location**: `percolator-prog/src/percolator.rs:178-220`
+**Status**: SECURE
+
+- Returns 0 if net_lp_pos == 0 (no inventory)
+- Returns 0 if price_e6 == 0 (invalid price)
+- Returns 0 if funding_horizon_slots == 0 (validated in UpdateConfig)
+- Uses saturating_mul for notional calculation
+- Division by zero protected (max(1) on scale)
+- Premium capped at ±funding_max_premium_bps
+- Sanity clamp to ±10,000 bps/slot
+- Policy clamp per config
+
 ## Session 6 Summary
 
-**Total Areas Verified This Session**: 86
+**Total Areas Verified This Session**: 88
 **Bug #9 Fixed**: Yes (clamp_toward_with_dt now returns index when dt=0)
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
