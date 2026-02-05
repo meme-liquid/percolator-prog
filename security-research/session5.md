@@ -1520,8 +1520,23 @@ Pattern verification:
 - Withdraw: Engine check → CPI transfer (both revert on any failure)
 - No external effects that persist after error
 
+#### 116. Feature Flag Safety ✓
+**Location**: `Cargo.toml` and throughout code
+**Status**: SECURE (with documented warnings)
+
+Feature flags:
+- `test`: Mock token transfers, skip oracle owner check (test only)
+- `devnet`: Skip oracle staleness/confidence (NEVER on mainnet)
+- `cu-audit`: Compute unit logging (harmless)
+- `unsafe_close`: Skip ALL CloseSlab validation (NEVER deploy)
+
+Cargo.toml verification:
+- No default features (all opt-in)
+- Production build without flags has full security
+- Dangerous flags clearly documented
+
 ## Session 7 Summary (Updated)
 
-**Total Areas Verified**: 115
+**Total Areas Verified**: 116
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
