@@ -4103,13 +4103,123 @@ The proof suite provides **high confidence** in protocol security:
 
 ---
 
-## COMPREHENSIVE SECURITY RESEARCH COMPLETE (Sessions 5-24)
+## Session 25: Integration Test Coverage Analysis
+
+**Date**: 2026-02-05
+**Focus**: Test coverage gaps, proptest verification, instruction coverage
+
+#### 271. Test Suite Overview ✓
+**Status**: COMPREHENSIVE
+
+**Coverage Summary**:
+- Integration tests: 57 (LiteSVM with production BPF)
+- Kani formal proofs: 271
+- Proptest fuzzing: 19 tests in percolator/tests/fuzzing.rs
+
+**Finding**: Three-layer verification (unit tests, formal proofs, fuzzing)
+
+#### 272. Instruction Coverage ✓
+**Status**: STRONG
+
+| Instruction | Test Count | Status |
+|-------------|------------|--------|
+| InitMarket | 17 | ✓ COMPREHENSIVE |
+| InitUser | Multiple | ✓ STRONG |
+| InitLP | Multiple | ✓ STRONG |
+| DepositCollateral | Multiple | ✓ STRONG |
+| WithdrawCollateral | 3 | ✓ BASIC |
+| KeeperCrank | 3 | ✓ BASIC |
+| TradeNoCpi | 7 | ✓ STRONG (Hyperp focused) |
+| LiquidateAtOracle | 2 | ⚠ BASIC |
+| CloseAccount | Multiple | ✓ STRONG |
+| TopUpInsurance | 2 | ✓ TESTED |
+| TradeCpi | 6 | ✓ STRONG |
+| Admin ops | 2 each | ✓ AUTH TESTED |
+| CloseSlab | 3 | ✓ BASIC |
+
+**Finding**: All instructions have coverage; some basic only
+
+#### 273. Security-Critical Test Coverage ✓
+**Status**: STRONG
+
+Areas with dedicated security tests:
+- Authorization rejection (6 tests)
+- Binding/shape validation (4 tests)
+- Hyperp mode security (7 tests)
+- Bug regression tests (7 tests: Bug #3-9, Finding L)
+- Margin enforcement tests
+- Position flip initial_margin_bps test
+- Insurance fund behavior (2 tests)
+
+**Finding**: Security-critical paths well covered
+
+#### 274. Proptest Fuzzing Coverage ✓
+**Status**: VERIFIED (percolator library)
+
+Location: `/home/anatoly/percolator/tests/fuzzing.rs`
+**19 fuzz tests** covering:
+- Global invariants (conservation, aggregates)
+- Action-based state machine fuzzer
+- Deterministic seeded fuzzer with logging
+- Solana rollback simulation
+
+Invariants tested:
+- vault >= C_tot + sum(settled_pnl) + insurance
+- c_tot == sum(capital)
+- pnl_pos_tot == sum(max(pnl, 0))
+- reserved_pnl <= max(0, pnl)
+
+**Finding**: Comprehensive property-based testing exists
+
+#### 275. Coverage Gaps (Minor) ✓
+**Status**: DOCUMENTED
+
+Lower coverage areas:
+- LiquidateAtOracle: Only 2 tests (basic cases)
+- KeeperCrank: Only 3 tests (permissionless + basic)
+- CloseSlab: Only 3 tests (validation focus)
+- Admin param setters: Auth-only tests
+
+These gaps are mitigated by:
+- Kani formal proofs cover invariants
+- Proptest fuzzes state machine
+- Happy path + error cases covered
+
+**Finding**: Gaps are low-risk; formal verification compensates
+
+#### 276. Regression Test Coverage ✓
+**Status**: COMPREHENSIVE
+
+Bug regression tests present for:
+- Bug #3: dust_base in CloseSlab
+- Bug #6: Threshold EWMA ramp from zero
+- Bug #9: Hyperp index smoothing dt=0 (FIXED)
+- Finding L: Initial margin enforcement (FIXED)
+- Finding G/C: Historical ADL atomicity
+
+**Finding**: All known bugs have regression tests
+
+## Session 25 Summary
+
+**Test Coverage Assessment**: STRONG
+**Total Tests**: 57 integration + 271 Kani + 19 proptest
+**Critical Paths**: All covered
+**Minor Gaps**: LiquidateAtOracle, KeeperCrank (basic coverage)
+
+The three-layer verification approach provides high confidence:
+1. Integration tests: End-to-end scenario validation
+2. Kani proofs: Invariant and property verification
+3. Proptest: State machine fuzzing with Solana rollback
+
+---
+
+## COMPREHENSIVE SECURITY RESEARCH COMPLETE (Sessions 5-25)
 
 ### Final Statistics
 
-**Total Sessions**: 20 (Sessions 5-24)
-**Total Areas Verified**: 270
-**Kani Proofs Analyzed**: 271 (all pass)
+**Total Sessions**: 21 (Sessions 5-25)
+**Total Areas Verified**: 276
+**Test Layers**: Integration (57) + Kani (271) + Proptest (19)
 **Critical Vulnerabilities Found**: 0
 **Design Trade-offs Documented**: 2 (LP trust, matcher pricing)
 
