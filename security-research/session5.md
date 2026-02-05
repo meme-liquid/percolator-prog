@@ -264,10 +264,91 @@ Pattern consistently applied:
   - LiquidateAtOracle (line 3150)
   - CloseAccount (line 3222)
 
+## Continued Session 5 Exploration (Part 3)
+
+#### 25. verify Module Pure Helpers ✓
+**Location**: `percolator-prog/src/percolator.rs:228-328`
+**Status**: SECURE
+
+All Kani-provable helpers:
+- `owner_ok`: Simple equality, stored == signer
+- `admin_ok`: Non-zero check + equality (prevents zero-address bypass)
+- `matcher_identity_ok`: Both program and context must match
+- `matcher_shape_ok`: Program executable, context not, context owned by program
+- `gate_active`: threshold > 0 AND balance <= threshold
+- `nonce_on_success`: wrapping_add(1) for replay protection
+- `cpi_trade_size`: ALWAYS uses exec_size, never requested_size
+
+#### 26. keeper_crank Logic ✓
+**Location**: `percolator/src/percolator.rs:1483-1679`
+**Status**: SECURE
+
+- Funding accrual uses STORED rate (anti-retroactivity)
+- Caller settlement with 50% discount (best-effort)
+- Crank cursor iteration: processes up to ACCOUNTS_PER_CRANK
+- Per-account operations:
+  - Maintenance fee settle (best-effort)
+  - Touch account + warmup settle
+  - Liquidation (if not in force-realize mode, budget limited)
+  - Force-close for zero equity or dust positions
+  - Force-realize (when insurance <= threshold)
+  - LP max tracking
+- Sweep completion detection: wraps around to sweep_start_idx
+- Garbage collection after crank
+
+#### 27. check_conservation ✓
+**Location**: `percolator/src/percolator.rs:3238-3308`
+**Status**: SECURE
+
+- Computes total_capital via for_each_used
+- Computes net_pnl with funding settlement simulation
+- Computes net_mark for mark-to-market PnL
+- Primary invariant: vault >= C_tot + I
+- Extended invariant: vault >= capital + (settled_pnl + mark_pnl) + insurance
+- Bounded slack (MAX_ROUNDING_SLACK) allowed for rounding
+
+#### 28. Liquidation Logic ✓
+**Location**: `percolator/src/percolator.rs:1689-1777`
+**Status**: SECURE
+
+mark_pnl_for_position:
+- Zero position returns 0
+- Longs profit when oracle > entry
+- Shorts profit when entry > oracle
+- Uses checked_mul/checked_div for overflow
+
+compute_liquidation_close_amount:
+- Deterministic closed-form calculation (no iteration)
+- Target margin = maintenance + buffer
+- Conservative rounding guard (subtracts 1 unit)
+- Dust kill-switch: full close if remaining < min_liquidation_abs
+
+#### 29. oracle_close_position_core ✓
+**Location**: `percolator/src/percolator.rs:1879-1927`
+**Status**: SECURE
+
+- Zero position returns early
+- mark_pnl overflow → wipes capital (conservative/safe)
+- Uses set_pnl to maintain pnl_pos_tot aggregate
+- Closes position, sets entry_price = oracle_price
+- Updates OI and LP aggregates
+- Settles warmup and writes off negative PnL (spec §6.1)
+
+#### 30. oracle_close_position_slice_core ✓
+**Location**: `percolator/src/percolator.rs:1792-1871`
+**Status**: SECURE
+
+- Falls back to full close if close_abs >= current_abs_pos
+- Computes proportional mark_pnl for closed slice
+- Uses checked_mul/checked_div with fallback
+- Updates position while maintaining sign
+- Updates OI and LP aggregates correctly
+- Entry price unchanged (correct for partial reduction)
+
 ## Session 5 Final Summary (Updated)
 
-**Total Areas Verified This Session**: 24
+**Total Areas Verified This Session**: 30
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
 
-The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 24 additional areas reviewed.
+The codebase continues to demonstrate strong security practices with comprehensive validation, authorization, overflow protection, and proper error handling across all 30 additional areas reviewed.
