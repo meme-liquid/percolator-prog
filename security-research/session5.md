@@ -789,9 +789,31 @@ compute_inventory_funding_bps_per_slot:
 - Rate capped at ±10,000 bps/slot
 - Policy clamp per config
 
-## Session 5 Final Summary (Part 10)
+## Continued Session 5 Exploration (Part 11)
 
-**Total Areas Verified This Session**: 58
+#### 59. Premium-Based Funding (Hyperp) ✓
+**Location**: `percolator-prog/src/percolator.rs:1985-2015`
+**Status**: SECURE
+
+- Zero checks: mark_e6, index_e6, funding_horizon_slots
+- Premium = (mark - index) * 10000 / index (in bps)
+- Clamp premium to ±max_premium_bps
+- saturating_mul for k multiplier
+- Per-slot clamp to ±max_bps_per_slot
+
+#### 60. Risk Reduction Gate (TradeCpi) ✓
+**Location**: `percolator-prog/src/percolator.rs:3067-3089`
+**Status**: SECURE
+
+- gate_active: threshold > 0 AND balance <= threshold
+- Uses O(1) LpRiskState::compute for risk calculation
+- would_increase_risk checks LP position delta
+- Uses actual exec_size from matcher (not requested)
+- Returns EngineRiskReductionOnlyMode error when blocked
+
+## Session 5 Final Summary (Part 11)
+
+**Total Areas Verified This Session**: 60
 **New Vulnerabilities Found**: 0
 **All 57 Integration Tests**: PASS
 
