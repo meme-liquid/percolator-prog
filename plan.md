@@ -767,6 +767,116 @@ The premarket resolution feature is implemented securely with:
 
 ---
 
+## I. Fresh Security Audit (2026-02-05)
+
+### I1. Audit Scope
+
+Re-audited all premarket resolution code paths:
+- ResolveMarket (Tag 19)
+- WithdrawInsurance (Tag 20)
+- Force-close branch in KeeperCrank
+- All is_resolved() state guards
+- Related instructions: CloseAccount, LiquidateAtOracle
+
+### I2. Findings
+
+#### Finding I2.1: LiquidateAtOracle Missing is_resolved Check
+**Severity: LOW (Acceptable Risk)**
+
+LiquidateAtOracle does not have an `is_resolved()` guard. However:
+- For hyperp markets, liquidation uses `last_effective_price_e6` (the index)
+- After resolution, index equals settlement price
+- Liquidation at settlement price is consistent with force-close
+- Admin can choose to crank force-close before anyone liquidates
+- **Risk**: Potential race condition between liquidation and force-close
+- **Mitigation**: Add is_resolved guard if strict ordering is required
+
+#### Finding I2.2: CloseAccount Missing is_resolved Check
+**Severity: N/A (Safe by Design)**
+
+CloseAccount does not have is_resolved guard, but this is SAFE:
+- `engine.close_account()` requires `position_size == 0`
+- Users with open positions cannot close until force-close settles them
+- After force-close, position is zeroed, then CloseAccount works
+- This is the intended flow: resolve → force-close → user closes account
+
+#### Finding I2.3: WithdrawInsurance State Order
+**Severity: N/A (Safe due to Atomicity)**
+
+WithdrawInsurance zeros insurance_fund.balance BEFORE calling transfer.
+This is SAFE because:
+- Solana transactions are atomic
+- If transfer fails, the `?` operator propagates error
+- Entire transaction rolls back, including the balance assignment
+- No state corruption is possible
+
+#### Finding I2.4: Settlement Price Unbounded
+**Severity: LOW (Admin Trusted)**
+
+`authority_price_e6` has no upper bound validation:
+- Admin could set extreme prices (e.g., u64::MAX)
+- Force-close would settle at extreme price
+- **Mitigation**: Admin is trusted; market config could add price bounds
+- **Impact**: Low - admin can already manipulate prices via PushOraclePrice
+
+#### Finding I2.5: PnL Division Precision
+**Severity: LOW (Acceptable)**
+
+Force-close PnL calculation uses integer division:
+```rust
+let pnl_delta = pos.saturating_mul(settle - entry) / 1_000_000i128;
+```
+- Small positions with tiny price changes may truncate to 0
+- This is consistent with standard trading PnL calculations
+- Truncation always rounds toward zero (conservative)
+
+### I3. Verification of State Guards
+
+| Instruction | is_resolved() Guard | Status |
+|-------------|---------------------|--------|
+| InitUser | ✓ Line 2473 | BLOCKED |
+| InitLP | ✓ Line 2514 | BLOCKED |
+| DepositCollateral | ✓ Line 2557 | BLOCKED |
+| TradeNoCpi | ✓ Line 2945 | BLOCKED |
+| TradeCpi | ✓ Line 3075 | BLOCKED |
+| TopUpInsurance | ✓ Line 3395 | BLOCKED |
+| ResolveMarket | ✓ Line 3677 (double-resolve) | BLOCKED |
+| WithdrawInsurance | ✓ Line 3713 (requires resolved) | REQUIRED |
+| WithdrawCollateral | ✗ (intentional) | ALLOWED |
+| CloseAccount | ✗ (safe - requires pos=0) | ALLOWED |
+| LiquidateAtOracle | ✗ (acceptable) | ALLOWED |
+| KeeperCrank | Force-close branch | SPECIAL HANDLING |
+
+### I4. Test Coverage Assessment
+
+**Covered:**
+- ✓ Full lifecycle (resolve → crank → withdraw insurance → close accounts)
+- ✓ State guards block new activity
+- ✓ User withdrawal allowed after resolve
+- ✓ Insurance withdrawal requires positions closed
+- ✓ Pagination with 100+ accounts
+- ✓ Binary outcomes (YES/NO pricing)
+- ✓ CU benchmark
+- ✓ pnl_pos_tot aggregate maintenance (Bug #10 fix)
+
+**Recommended Additional Tests:**
+- LiquidateAtOracle during force-close pagination
+- Extreme settlement prices (boundary testing)
+- CloseAccount interleaved with force-close cranks
+
+### I5. Audit Conclusion
+
+**Security Status: ✓ PRODUCTION READY**
+
+All critical paths verified. Identified low-severity items are:
+- Acceptable design tradeoffs (admin trusted)
+- Protected by Solana transaction atomicity
+- Consistent with standard exchange behavior
+
+No exploitable vulnerabilities found.
+
+---
+
 ## H. [FIXED] Stale `pnl_pos_tot` After Force-Close
 
 **Status: FIXED** (commit f66f2d2, 2026-02-05)
