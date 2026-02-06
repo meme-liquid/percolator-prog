@@ -2652,8 +2652,9 @@ pub mod processor {
                     .withdraw(user_idx, units_requested as u128, clock.slot, price)
                     .map_err(map_risk_error)?;
 
-                // Convert units back to base tokens for payout
-                let base_to_pay = crate::units::units_to_base(units_requested, config.unit_scale);
+                // Convert units back to base tokens for payout (checked to prevent silent overflow)
+                let base_to_pay = crate::units::units_to_base_checked(units_requested, config.unit_scale)
+                    .ok_or(PercolatorError::EngineOverflow)?;
 
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
@@ -3363,8 +3364,9 @@ pub mod processor {
                 }
                 let amt_units_u64: u64 = amt_units.try_into().map_err(|_| PercolatorError::EngineOverflow)?;
 
-                // Convert units to base tokens for payout
-                let base_to_pay = crate::units::units_to_base(amt_units_u64, config.unit_scale);
+                // Convert units to base tokens for payout (checked to prevent silent overflow)
+                let base_to_pay = crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
+                    .ok_or(PercolatorError::EngineOverflow)?;
 
                 let seed1: &[u8] = b"vault";
                 let seed2: &[u8] = a_slab.key.as_ref();
@@ -3752,7 +3754,8 @@ pub mod processor {
                 } else {
                     insurance_units as u64
                 };
-                let base_amount = crate::units::units_to_base(units_u64, config.unit_scale);
+                let base_amount = crate::units::units_to_base_checked(units_u64, config.unit_scale)
+                    .ok_or(PercolatorError::EngineOverflow)?;
 
                 // Zero out insurance fund
                 engine.insurance_fund.balance = percolator::U128::ZERO;

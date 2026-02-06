@@ -1448,25 +1448,51 @@ fn kani_tradecpi_from_ret_any_accept_increments_nonce() {
 }
 
 /// Prove: ANY acceptance uses exec_size from ret, not req_size
+/// NON-VACUOUS: Forces Accept path by constraining inputs to valid state
 #[kani::proof]
 fn kani_tradecpi_from_ret_accept_uses_exec_size() {
     let old_nonce: u64 = kani::any();
+    // Force valid matcher shape
     let shape = MatcherAccountsShape {
-        prog_executable: kani::any(),
-        ctx_executable: kani::any(),
-        ctx_owner_is_prog: kani::any(),
-        ctx_len_ok: kani::any(),
+        prog_executable: true,
+        ctx_executable: false,
+        ctx_owner_is_prog: true,
+        ctx_len_ok: true,
     };
-    let identity_ok: bool = kani::any();
-    let pda_ok: bool = kani::any();
-    let user_auth_ok: bool = kani::any();
-    let lp_auth_ok: bool = kani::any();
-    let gate_is_active: bool = kani::any();
-    let risk_increase: bool = kani::any();
-    let ret = any_matcher_return_fields();
+    // Force all authorization checks to pass
+    let identity_ok: bool = true;
+    let pda_ok: bool = true;
+    let user_auth_ok: bool = true;
+    let lp_auth_ok: bool = true;
+    let gate_is_active: bool = false;  // Gate inactive = no risk check
+    let risk_increase: bool = kani::any();  // Doesn't matter when gate inactive
+
+    // Force valid matcher return
+    let exec_size: i128 = kani::any();
+    let req_size: i128 = kani::any();
+    kani::assume(exec_size != 0);
+    kani::assume(req_size != 0);
+    // exec_size must have same sign as req_size and |exec_size| <= |req_size|
+    kani::assume((exec_size > 0) == (req_size > 0));
+    kani::assume(exec_size.unsigned_abs() <= req_size.unsigned_abs());
+
     let lp_account_id: u64 = kani::any();
     let oracle_price_e6: u64 = kani::any();
-    let req_size: i128 = kani::any();
+    kani::assume(oracle_price_e6 > 0);
+
+    // req_id must match nonce_on_success(old_nonce) for ABI validation
+    let expected_req_id = nonce_on_success(old_nonce);
+
+    let ret = MatcherReturnFields {
+        abi_version: MATCHER_ABI_VERSION,
+        flags: FLAG_VALID,
+        exec_price_e6: kani::any::<u64>().max(1),  // Non-zero price
+        exec_size,
+        req_id: expected_req_id,  // Must match nonce_on_success(old_nonce)
+        lp_account_id,  // Must match
+        oracle_price_e6,  // Must match
+        reserved: 0,
+    };
 
     let decision = decide_trade_cpi_from_ret(
         old_nonce, shape, identity_ok, pda_ok,
@@ -1474,9 +1500,15 @@ fn kani_tradecpi_from_ret_accept_uses_exec_size() {
         ret, lp_account_id, oracle_price_e6, req_size
     );
 
-    if let TradeCpiDecision::Accept { chosen_size, .. } = decision {
-        assert_eq!(chosen_size, ret.exec_size,
-            "TradeCpi accept must use exec_size from matcher return, not req_size");
+    // MUST be Accept with these inputs - panic if not (catches regression)
+    match decision {
+        TradeCpiDecision::Accept { chosen_size, .. } => {
+            assert_eq!(chosen_size, ret.exec_size,
+                "TradeCpi accept must use exec_size from matcher return, not req_size");
+        }
+        TradeCpiDecision::Reject => {
+            panic!("Expected Accept with valid inputs - function may have regressed to always-reject");
+        }
     }
 }
 
@@ -1888,24 +1920,28 @@ fn kani_base_to_units_monotonic() {
     assert!(units1 <= units2, "base_to_units must be monotonic");
 }
 
-/// Prove: units_to_base is strictly monotonic (without overflow)
+///// Prove: units_to_base is strictly monotonic when products don't overflow.
+/// NOTE: At saturation (units * scale >= u64::MAX), both return u64::MAX,
+/// breaking strict monotonicity. This proof bounds inputs to non-saturating range.
+/// Production code should use units_to_base_checked to detect overflow.
 #[kani::proof]
-fn kani_units_to_base_monotonic() {
+fn kani_units_to_base_monotonic_bounded() {
     let scale: u32 = kani::any();
     kani::assume(scale > 0);
     kani::assume(scale <= KANI_MAX_SCALE);
 
-    // Cap units to keep products small
+    // Cap units to keep products below overflow threshold
     let units1: u64 = kani::any();
     let units2: u64 = kani::any();
     kani::assume(units1 <= KANI_MAX_QUOTIENT);
     kani::assume(units2 <= KANI_MAX_QUOTIENT);
     kani::assume(units1 < units2);
 
+    // Within these bounds, no saturation occurs
     let base1 = units_to_base(units1, scale);
     let base2 = units_to_base(units2, scale);
 
-    assert!(base1 < base2, "units_to_base must be strictly monotonic");
+    assert!(base1 < base2, "units_to_base is strictly monotonic when not saturating");
 }
 
 /// Prove: scale==0 preserves monotonicity for base_to_units
