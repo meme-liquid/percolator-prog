@@ -2788,6 +2788,7 @@ fn kani_scale_price_e6_valid_result() {
     kani::assume(unit_scale > 1);
     kani::assume(unit_scale <= KANI_MAX_SCALE);  // Keep SAT tractable
     kani::assume(price >= unit_scale as u64);    // Ensures result >= 1
+    kani::assume(price <= KANI_MAX_QUOTIENT as u64 * unit_scale as u64); // Tight bound for SAT
 
     // PRODUCTION function should succeed
     let result = scale_price_e6(price, unit_scale);
@@ -2831,7 +2832,9 @@ fn kani_scale_price_and_base_to_units_use_same_divisor() {
     kani::assume(unit_scale > 1);
     kani::assume(unit_scale <= KANI_MAX_SCALE);
     kani::assume(base_tokens >= unit_scale as u64);
+    kani::assume(base_tokens <= KANI_MAX_QUOTIENT as u64 * unit_scale as u64); // Tight bound for SAT
     kani::assume(oracle_price >= unit_scale as u64);
+    kani::assume(oracle_price <= KANI_MAX_QUOTIENT as u64 * unit_scale as u64); // Tight bound for SAT
 
     // Call PRODUCTION functions
     let (capital_units, _dust) = base_to_units(base_tokens, unit_scale);
