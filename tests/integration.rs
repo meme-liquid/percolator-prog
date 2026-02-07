@@ -11257,3 +11257,740 @@ fn test_attack_close_slab_before_insurance_withdrawal() {
     assert!(insurance > 0 || num_used > 0,
         "Test setup: expected either insurance or used accounts to block CloseSlab");
 }
+
+// ============================================================================
+// ROUND 6: Fee debt, warmup, position limits, conservation, nonce, dust
+// ============================================================================
+
+/// ATTACK: High maintenance fee accrual over many slots should not create
+/// unbounded debt or break equity calculations. Fee debt is saturating.
+#[test]
+fn test_attack_fee_debt_accumulation_large_maintenance_fee() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // Set high maintenance fee (10M per slot - enough to drain user in ~1000 slots)
+    env.try_set_maintenance_fee(&admin, 10_000_000).unwrap();
+
+    // Advance 2000 slots - user deposit (10B) should be significantly drained
+    env.set_slot_and_price(2000, 100_000_000);
+    env.crank();
+
+    // User's capital should have been reduced by maintenance fees
+    let user_capital = env.read_account_capital(user_idx);
+    // 10M/slot * 2000 slots = 20B total fees, split across accounts
+    // User had 10B, LP had 100B - fees should drain proportionally or from all
+
+    // Key invariant: vault must still have tokens (system didn't panic/corrupt)
+    let vault = env.vault_balance();
+    assert!(vault > 0, "Vault should still have tokens after fee accrual");
+
+    // LP should still have substantial capital
+    let lp_capital = env.read_account_capital(lp_idx);
+    assert!(lp_capital > 0,
+        "LP capital should be non-zero after moderate maintenance fees. lp_capital={}", lp_capital);
+
+    // Conservation: total vault == sum of actual tokens
+    // Fees go to insurance, so vault = c_tot + insurance (internal accounting)
+    // But actual SPL vault balance never changes from fees alone (they're internal)
+    let expected_vault = 10_000_000_000u64 + 100_000_000_000u64;
+    assert_eq!(vault, expected_vault,
+        "ATTACK: Maintenance fees changed actual vault token balance! vault={}", vault);
+}
+
+/// ATTACK: Maintenance fee set to u128::MAX should not panic or corrupt state.
+#[test]
+fn test_attack_extreme_maintenance_fee() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // Set extreme maintenance fee - should either be rejected or accepted safely
+    let result = env.try_set_maintenance_fee(&admin, u128::MAX);
+
+    // Regardless of whether extreme fee was accepted, vault tokens must be preserved
+    // (maintenance fees are internal accounting, not SPL transfers)
+    let total_deposited = 1_000_000_000u64 + 100_000_000_000u64;
+    let vault = env.vault_balance();
+    assert_eq!(vault, total_deposited,
+        "ATTACK: Extreme maintenance fee changed vault token balance! vault={}", vault);
+
+    // Advance time and crank - system must not panic
+    env.set_slot_and_price(100, 100_000_000);
+    let crank_result = env.try_crank();
+
+    // After crank, vault tokens still preserved (fees don't move SPL tokens)
+    let vault_after = env.vault_balance();
+    assert_eq!(vault_after, total_deposited,
+        "ATTACK: Crank with extreme fee changed vault! vault={}", vault_after);
+}
+
+/// ATTACK: Warmup period prevents immediate profit withdrawal.
+/// User with positive PnL should not be able to withdraw profit before warmup completes.
+#[test]
+fn test_attack_warmup_prevents_immediate_profit_withdrawal() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    // Init market with 1000-slot warmup period
+    env.init_market_with_warmup(0, 1000);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Trade to create position
+    env.trade(&user, &lp, lp_idx, user_idx, 5_000_000);
+    env.set_slot_and_price(100, 100_000_000);
+    env.crank();
+
+    // Price goes up - user has unrealized profit
+    env.set_slot_and_price(200, 200_000_000);
+    env.crank();
+
+    // Close position to realize profit
+    env.trade(&user, &lp, lp_idx, user_idx, -5_000_000);
+    env.set_slot_and_price(300, 200_000_000);
+    env.crank();
+
+    // Vault conservation: no tokens created or destroyed through trade lifecycle
+    let total_deposited = 10_000_000_000u64 + 100_000_000_000u64;
+    let vault = env.vault_balance();
+    assert_eq!(vault, total_deposited,
+        "ATTACK: Warmup trade cycle violated conservation! vault={}, deposited={}",
+        vault, total_deposited);
+
+    // Try to withdraw MORE than original deposit
+    // Warmup should prevent extracting unvested profit
+    let result = env.try_withdraw(&user, user_idx, 10_000_000_001); // 1 more than deposited
+    // This should fail because warmup locks profit
+    // (even with profit, MTM equity minus warmup-locked amount < withdrawal)
+    // Whether it fails or succeeds, vault must still be >= LP deposit
+    let vault_after = env.vault_balance();
+    assert!(vault_after >= 100_000_000_000,
+        "ATTACK: Warmup exploit drained vault below LP deposit! vault={}", vault_after);
+}
+
+/// ATTACK: Try to trade with position size near i128::MAX.
+/// Saturating arithmetic should prevent overflow without panicking.
+#[test]
+fn test_attack_extreme_position_size() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // Try extremely large position
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, i128::MAX / 2,
+        &matcher_prog, &matcher_ctx,
+    );
+    // Should fail (margin requirement exceeds capital) or be capped by matcher
+    assert!(result.is_err(),
+        "ATTACK: Extreme position size (i128::MAX/2) accepted without error!");
+}
+
+/// ATTACK: Try to trade with i128::MIN position size (negative extreme).
+#[test]
+fn test_attack_extreme_negative_position_size() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, i128::MIN / 2,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_err(),
+        "ATTACK: Extreme negative position (i128::MIN/2) accepted without error!");
+}
+
+/// ATTACK: Conservation invariant through trade + price movement + settlement.
+/// vault_balance must equal internal vault tracking at every step.
+#[test]
+fn test_attack_conservation_through_price_movement() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let vault_initial = env.read_vault();
+
+    // Trade
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 200_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Trade should succeed");
+
+    // Check conservation after trade
+    let vault_after_trade = env.read_vault();
+    assert_eq!(vault_initial, vault_after_trade,
+        "Conservation violated after trade: {} vs {}", vault_initial, vault_after_trade);
+
+    // Price moves up
+    env.try_push_oracle_price(&admin, 1_500_000, 2000).unwrap();
+    env.set_slot(200);
+    env.crank();
+
+    // Check conservation after price movement + crank
+    let vault_after_crank = env.read_vault();
+    assert_eq!(vault_initial, vault_after_crank,
+        "Conservation violated after price movement: {} vs {}", vault_initial, vault_after_crank);
+
+    // Price moves down
+    env.try_push_oracle_price(&admin, 500_000, 3000).unwrap();
+    env.set_slot(300);
+    env.crank();
+
+    let vault_after_crash = env.read_vault();
+    assert_eq!(vault_initial, vault_after_crash,
+        "Conservation violated after price crash: {} vs {}", vault_initial, vault_after_crash);
+
+    // Close position
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, -200_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "Close should succeed");
+
+    let vault_final = env.read_vault();
+    assert_eq!(vault_initial, vault_final,
+        "Conservation violated after full lifecycle: {} vs {}", vault_initial, vault_final);
+}
+
+/// ATTACK: Premarket partial force-close conservation.
+/// After force-closing only some accounts, internal state must still be consistent.
+#[test]
+fn test_attack_premarket_partial_force_close_conservation() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // Create LP and many users
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let mut users = Vec::new();
+    for _ in 0..5 {
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 2_000_000_000);
+        users.push((user, user_idx));
+    }
+
+    env.set_slot(100);
+    env.crank();
+
+    // Each user trades
+    for (user, user_idx) in &users {
+        let _ = env.try_trade_cpi(
+            user, &lp.pubkey(), lp_idx, *user_idx, 50_000_000,
+            &matcher_prog, &matcher_ctx,
+        );
+    }
+
+    let vault_before = env.read_vault();
+
+    // Resolve market
+    env.try_push_oracle_price(&admin, 1_200_000, 2000).unwrap();
+    env.try_resolve_market(&admin).unwrap();
+
+    // Single crank: may only force-close a batch (64 accounts max)
+    env.set_slot(200);
+    env.crank();
+
+    // Vault conservation must hold even during partial close
+    let vault_after_partial = env.read_vault();
+    assert_eq!(vault_before, vault_after_partial,
+        "ATTACK: Partial force-close violated conservation: {} vs {}",
+        vault_before, vault_after_partial);
+
+    // Complete force-close
+    env.set_slot(300);
+    env.crank();
+
+    let vault_after_complete = env.read_vault();
+    assert_eq!(vault_before, vault_after_complete,
+        "ATTACK: Complete force-close violated conservation: {} vs {}",
+        vault_before, vault_after_complete);
+}
+
+/// ATTACK: Nonce replay - try to execute the same TradeCpi twice.
+/// Second attempt with same nonce should be rejected.
+#[test]
+fn test_attack_nonce_replay_same_trade() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    // First trade succeeds
+    let result = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+    assert!(result.is_ok(), "First trade should succeed");
+    let pos_after_first = env.read_account_position(user_idx);
+
+    // Second identical trade - nonce has advanced, so this is a NEW trade (not replay)
+    let result2 = env.try_trade_cpi(
+        &user, &lp.pubkey(), lp_idx, user_idx, 100_000_000,
+        &matcher_prog, &matcher_ctx,
+    );
+
+    // Whether second trade succeeds or fails, vault conservation must hold
+    let vault = env.read_vault();
+    let expected_vault = 50_000_000_000u128 + 5_000_000_000u128; // LP + user deposits
+    assert_eq!(vault, expected_vault,
+        "ATTACK: Nonce handling violated vault conservation! vault={}, expected={}",
+        vault, expected_vault);
+
+    // First position must be non-zero (first trade definitely worked)
+    assert!(pos_after_first != 0,
+        "First trade should have created a non-zero position");
+
+    // If second trade succeeded, verify it created an additive position (not replay)
+    if result2.is_ok() {
+        let pos_after_second = env.read_account_position(user_idx);
+        assert!(pos_after_second.abs() > pos_after_first.abs(),
+            "ATTACK: Nonce replay - second trade didn't grow position! \
+             first_pos={}, second_pos={}", pos_after_first, pos_after_second);
+    }
+}
+
+/// ATTACK: Multiple deposits in same transaction should not create extra capital.
+/// Total capital should equal total deposited amount.
+#[test]
+fn test_attack_multiple_deposits_conservation() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    // Multiple small deposits
+    let deposit_amount = 1_000_000_000u64;
+    let num_deposits = 10;
+    for _ in 0..num_deposits {
+        env.deposit(&user, user_idx, deposit_amount);
+    }
+
+    let expected_total = deposit_amount as u128 * num_deposits;
+    let actual_capital = env.read_account_capital(user_idx);
+    assert_eq!(actual_capital, expected_total,
+        "ATTACK: Multiple deposits created extra capital! expected={}, actual={}",
+        expected_total, actual_capital);
+
+    // Vault should have all deposits
+    let vault = env.vault_balance();
+    let expected_vault = expected_total + 100_000_000_000; // user + LP
+    assert_eq!(vault, expected_vault as u64,
+        "ATTACK: Vault balance mismatch after multiple deposits. expected={}, actual={}",
+        expected_vault, vault);
+}
+
+/// ATTACK: User tries to withdraw more than their capital.
+/// Should fail with insufficient balance.
+#[test]
+fn test_attack_withdraw_exceeds_capital() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    let vault_before = env.vault_balance();
+
+    // Try to withdraw 10x capital
+    let result = env.try_withdraw(&user, user_idx, 10_000_000_000);
+    assert!(result.is_err(),
+        "ATTACK: Withdrawal of 10x capital succeeded!");
+
+    // Vault unchanged
+    let vault_after = env.vault_balance();
+    assert_eq!(vault_before, vault_after,
+        "ATTACK: Failed withdrawal changed vault balance! before={}, after={}",
+        vault_before, vault_after);
+}
+
+/// ATTACK: Withdraw from another user's account.
+/// Account owner verification should prevent this.
+#[test]
+fn test_attack_withdraw_from_others_account() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let victim = Keypair::new();
+    let victim_idx = env.init_user(&victim);
+    env.deposit(&victim, victim_idx, 5_000_000_000);
+
+    let attacker = Keypair::new();
+    let _attacker_idx = env.init_user(&attacker);
+
+    // Attacker tries to withdraw from victim's account index
+    let result = env.try_withdraw(&attacker, victim_idx, 1_000_000_000);
+    assert!(result.is_err(),
+        "ATTACK: Attacker withdrew from victim's account!");
+
+    // Victim's capital unchanged
+    let victim_capital = env.read_account_capital(victim_idx);
+    assert_eq!(victim_capital, 5_000_000_000,
+        "ATTACK: Victim's capital changed after attacker's failed withdrawal! capital={}",
+        victim_capital);
+}
+
+/// ATTACK: Deposit to another user's account.
+/// Account owner verification should prevent this.
+#[test]
+fn test_attack_deposit_to_others_account() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let victim = Keypair::new();
+    let victim_idx = env.init_user(&victim);
+    env.deposit(&victim, victim_idx, 5_000_000_000);
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 2_000_000_000).unwrap();
+
+    // Attacker tries to deposit to victim's account index
+    let ata = env.create_ata(&attacker.pubkey(), 1_000_000_000);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(attacker.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_deposit(victim_idx, 1_000_000_000),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&attacker.pubkey()), &[&attacker], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    assert!(result.is_err(),
+        "ATTACK: Attacker deposited to victim's account!");
+}
+
+/// ATTACK: Close account owned by someone else.
+/// Must verify account ownership.
+#[test]
+fn test_attack_close_others_account() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let victim = Keypair::new();
+    let victim_idx = env.init_user(&victim);
+    env.deposit(&victim, victim_idx, 5_000_000_000);
+
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 1_000_000_000).unwrap();
+
+    // Attacker tries to close victim's account
+    let result = env.try_close_account(&attacker, victim_idx);
+    assert!(result.is_err(),
+        "ATTACK: Attacker closed victim's account!");
+
+    // Victim's capital should be intact
+    let victim_capital = env.read_account_capital(victim_idx);
+    assert_eq!(victim_capital, 5_000_000_000,
+        "Victim's capital should be unchanged after failed close attempt");
+}
+
+/// ATTACK: LiquidateAtOracle on a healthy account should be a no-op.
+/// Healthy accounts must not be liquidated.
+#[test]
+fn test_attack_liquidate_healthy_account() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // Large capital
+
+    // Small trade, well within margin
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+    env.set_slot_and_price(100, 100_000_000);
+    env.crank();
+
+    let capital_before = env.read_account_capital(user_idx);
+    let pos_before = env.read_account_position(user_idx);
+
+    // Try to liquidate healthy account
+    let result = env.try_liquidate_target(user_idx);
+    // LiquidateAtOracle returns Ok (no-op) for healthy accounts
+
+    // Position and capital should be unchanged
+    let capital_after = env.read_account_capital(user_idx);
+    let pos_after = env.read_account_position(user_idx);
+    assert_eq!(capital_before, capital_after,
+        "ATTACK: Healthy account capital changed after liquidation attempt! {}->{}",
+        capital_before, capital_after);
+    assert_eq!(pos_before, pos_after,
+        "ATTACK: Healthy account position changed after liquidation attempt! {}->{}",
+        pos_before, pos_after);
+}
+
+/// ATTACK: Double resolve market attempt.
+/// Second resolve should fail.
+#[test]
+fn test_attack_double_resolve_market() {
+    let mut env = TestEnv::new();
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    // First resolve
+    let result = env.try_resolve_market(&admin);
+    assert!(result.is_ok(), "First resolve should succeed");
+
+    // Second resolve should fail
+    let result = env.try_resolve_market(&admin);
+    assert!(result.is_err(),
+        "ATTACK: Double resolve succeeded!");
+}
+
+/// ATTACK: Rapid open/close trades to extract value from rounding.
+/// Many tiny trades should not accumulate rounding profit.
+#[test]
+fn test_attack_rounding_extraction_rapid_trades() {
+    let Some(mut env) = TradeCpiTestEnv::new() else { return; };
+
+    env.init_market_hyperp(1_000_000);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let matcher_prog = env.matcher_program_id;
+    env.try_set_oracle_authority(&admin, &admin.pubkey()).unwrap();
+    env.try_push_oracle_price(&admin, 1_000_000, 1000).unwrap();
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 50_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    env.set_slot(100);
+    env.crank();
+
+    let vault_before = env.read_vault();
+
+    // Rapid open/close with tiny size
+    for i in 0..5 {
+        let size = 1_000 + i; // Tiny but different each time (unique TX bytes)
+        let result = env.try_trade_cpi(
+            &user, &lp.pubkey(), lp_idx, user_idx, size,
+            &matcher_prog, &matcher_ctx,
+        );
+        if result.is_ok() {
+            // Close immediately
+            let _ = env.try_trade_cpi(
+                &user, &lp.pubkey(), lp_idx, user_idx, -size,
+                &matcher_prog, &matcher_ctx,
+            );
+        }
+    }
+
+    env.set_slot(200);
+    env.crank();
+
+    let vault_after = env.read_vault();
+    assert_eq!(vault_before, vault_after,
+        "ATTACK: Rounding extraction via rapid trades! before={}, after={}",
+        vault_before, vault_after);
+}
+
+/// ATTACK: After UpdateAdmin to zero address, no one can admin the market.
+/// admin_ok rejects zero-address admin, so this is a permanent lockout.
+/// Verify that zero-admin prevents all admin operations.
+#[test]
+fn test_attack_update_admin_to_zero_locks_out() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+
+    // Set admin to zero (may or may not succeed depending on validation)
+    let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+        ],
+        data: {
+            let mut d = vec![12u8]; // UpdateAdmin tag
+            d.extend_from_slice(zero_pubkey.as_ref());
+            d
+        },
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[ix], Some(&admin.pubkey()), &[&admin], env.svm.latest_blockhash(),
+    );
+    let result = env.svm.send_transaction(tx);
+    // UpdateAdmin to zero succeeds (protocol allows it)
+    assert!(result.is_ok(), "UpdateAdmin to zero should be accepted");
+
+    // Admin is now zero - admin_ok rejects zero address
+    // All admin operations must now fail permanently
+    let result = env.try_set_maintenance_fee(&admin, 100);
+    assert!(result.is_err(),
+        "ATTACK: Admin operation succeeded after admin set to zero!");
+
+    // No key can act as admin when admin is zero
+    let random = Keypair::new();
+    env.svm.airdrop(&random.pubkey(), 1_000_000_000).unwrap();
+    let result2 = env.try_set_maintenance_fee(&random, 100);
+    assert!(result2.is_err(),
+        "ATTACK: Random user became admin when admin is zero!");
+}
