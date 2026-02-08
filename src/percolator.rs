@@ -1096,6 +1096,9 @@ pub mod ix {
         ResolveMarket,
         /// Withdraw insurance fund balance (admin only, requires RESOLVED flag).
         WithdrawInsurance,
+        /// Admin force-close an abandoned account after market resolution.
+        /// Requires RESOLVED flag, zero position, admin signer.
+        AdminForceCloseAccount { user_idx: u16 },
     }
 
     impl Instruction {
@@ -1219,6 +1222,10 @@ pub mod ix {
                 },
                 19 => Ok(Instruction::ResolveMarket),
                 20 => Ok(Instruction::WithdrawInsurance),
+                21 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::AdminForceCloseAccount { user_idx })
+                },
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -3776,6 +3783,105 @@ pub mod processor {
                     base_amount,
                     &signer_seeds,
                 )?;
+            }
+
+            Instruction::AdminForceCloseAccount { user_idx } => {
+                // Admin force-close an abandoned account after market resolution.
+                // Settles PnL (with haircut for positive), forgives fee debt,
+                // then delegates to engine.close_account() for the rest.
+                accounts::expect_len(accounts, 8)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let a_vault = &accounts[2];
+                let a_owner_ata = &accounts[3];
+                let a_pda = &accounts[4];
+                let a_token = &accounts[5];
+                let a_oracle = &accounts[7];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+                verify_token_program(a_token)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                // Must be resolved
+                if !state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData);
+                }
+
+                let mut config = state::read_config(&data);
+                let mint = Pubkey::new_from_array(config.collateral_mint);
+
+                let (auth, _) = accounts::derive_vault_authority(program_id, a_slab.key);
+                verify_vault(a_vault, &auth, &mint, &Pubkey::new_from_array(config.vault_pubkey))?;
+                accounts::expect_key(a_pda, &auth)?;
+
+                let clock = Clock::from_account_info(&accounts[6])?;
+
+                // Read oracle price (hyperp uses last_effective_price_e6)
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let price = if is_hyperp {
+                    let idx = config.last_effective_price_e6;
+                    if idx == 0 {
+                        return Err(PercolatorError::OracleInvalid.into());
+                    }
+                    idx
+                } else {
+                    oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?
+                };
+                state::write_config(&mut data, &config);
+
+                let engine = zc::engine_mut(&mut data)?;
+
+                check_idx(engine, user_idx)?;
+
+                // Position must be zero (force-closed by prior crank)
+                if !engine.accounts[user_idx as usize].position_size.is_zero() {
+                    return Err(PercolatorError::EngineUndercollateralized.into());
+                }
+
+                // Read account owner pubkey and verify owner ATA
+                let owner_pubkey = Pubkey::new_from_array(engine.accounts[user_idx as usize].owner);
+                verify_token_account(a_owner_ata, &owner_pubkey, &mint)?;
+
+                // Force-settle PnL so close_account's pnl==0 check passes
+                let pnl = engine.accounts[user_idx as usize].pnl.get();
+                let capital = engine.accounts[user_idx as usize].capital.get();
+                if pnl > 0 {
+                    let haircutted = engine.effective_pos_pnl(pnl);
+                    engine.set_capital(user_idx as usize, capital.saturating_add(haircutted));
+                    engine.set_pnl(user_idx as usize, 0);
+                } else if pnl < 0 {
+                    let loss = (-pnl) as u128;
+                    engine.set_capital(user_idx as usize, capital.saturating_sub(loss));
+                    engine.set_pnl(user_idx as usize, 0);
+                }
+
+                // Forgive fee debt so close_account doesn't fail
+                engine.accounts[user_idx as usize].fee_credits = percolator::I128::ZERO;
+
+                // close_account: touch_account_full, free_slot, vault decrement
+                let amt_units = engine.close_account(user_idx, clock.slot, price)
+                    .map_err(map_risk_error)?;
+                let amt_units_u64: u64 = amt_units.try_into()
+                    .map_err(|_| PercolatorError::EngineOverflow)?;
+
+                let base_to_pay = crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+
+                let seed1: &[u8] = b"vault";
+                let seed2: &[u8] = a_slab.key.as_ref();
+                let bump_arr: [u8; 1] = [config.vault_authority_bump];
+                let seed3: &[u8] = &bump_arr;
+                let seeds: [&[u8]; 3] = [seed1, seed2, seed3];
+                let signer_seeds: [&[&[u8]]; 1] = [&seeds];
+
+                collateral::withdraw(a_token, a_vault, a_owner_ata, a_pda, base_to_pay, &signer_seeds)?;
             }
         }
         Ok(())
