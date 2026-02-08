@@ -22124,6 +22124,26 @@ fn test_property_state_machine_invariants() {
     }
 }
 
+/// EXTENDED PROPERTY TEST: Deep state machine fuzzer (200 seeds × 200 steps = 40,000 ops).
+/// Run with: cargo test test_property_state_machine_extended -- --ignored
+#[test]
+#[ignore]
+fn test_property_state_machine_extended() {
+    let path = program_path();
+    if !path.exists() { return; }
+
+    for seed in 1..=200 {
+        let mut fuzzer = IntegrationFuzzer::new(seed);
+        fuzzer.setup();
+        let mut rng = FuzzRng::new(seed);
+
+        for _ in 0..200 {
+            let action = fuzzer.random_action(&mut rng);
+            fuzzer.execute(action);
+        }
+    }
+}
+
 /// PROPERTY TEST: Authorization - every instruction rejects wrong signer.
 ///
 /// Subsumes the following classes of individual tests:
