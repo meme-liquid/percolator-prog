@@ -8,7 +8,7 @@ extern crate alloc;
 use solana_program::pubkey::Pubkey;
 use solana_program::declare_id;
 
-declare_id!("Perco1ator111111111111111111111111111111111");
+declare_id!("DP2EbA2v6rmkmNieZpnjumXosuXQ93r9jyb9eSzzkf1x");
 
 // 1. mod constants
 pub mod constants {

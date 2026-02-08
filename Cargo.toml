@@ -27,7 +27,7 @@ pinocchio = "0.6"
 arrayref = "0.3"
 num-derive = "0.4"
 num-traits = "0.2"
-percolator = { path = "../percolator" }
+percolator = { path = "./percolator" }
 
 [dev-dependencies]
 bincode = "1"
