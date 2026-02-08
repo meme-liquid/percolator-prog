@@ -254,6 +254,11 @@ fn test_risk_engine_alignment() {
 fn program_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/deploy/percolator_prog.so");
+    assert!(
+        path.exists(),
+        "BPF not found at {:?}. Run: cargo build-sbf",
+        path
+    );
     path
 }
 
@@ -301,6 +306,7 @@ fn encode_init_market(admin: &Pubkey, mint: &Pubkey, feed_id: &[u8; 32]) -> Vec<
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // RiskParams
     data.extend_from_slice(&0u64.to_le_bytes()); // warmup_period_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
@@ -600,7 +606,9 @@ fn test_bpf_i128_alignment() {
     println!("   Deposited {} to user", user_deposit);
 
     // Execute a trade to create position values
-    let trade_size: i128 = 1_000_000_000i128;  // 1B units
+    // Keep this comfortably within initial margin to exercise the happy-path
+    // write/read flow for alignment, not risk rejections.
+    let trade_size: i128 = 900_000_000i128;
     println!("6. Executing trade: user buys {} from LP...", trade_size);
 
     let ix = Instruction {

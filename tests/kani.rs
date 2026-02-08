@@ -2080,16 +2080,7 @@ fn kani_accumulate_dust_saturates() {
 
     let result = accumulate_dust(old, added);
 
-    // Result must be >= old (saturating)
-    assert!(result >= old, "accumulate must be >= old");
-    // Result must be <= MAX (saturating prevents overflow)
-    assert!(result <= u64::MAX, "accumulate must not overflow");
-    // If no overflow, result == old + added
-    if old.checked_add(added).is_some() {
-        assert_eq!(result, old + added, "no overflow means exact sum");
-    } else {
-        assert_eq!(result, u64::MAX, "overflow saturates to MAX");
-    }
+    assert_eq!(result, old.saturating_add(added), "accumulate_dust must match saturating_add");
 }
 
 /// Prove: scale==0 policy - base_to_units never produces dust
@@ -2701,7 +2692,8 @@ fn kani_scale_validation_pure() {
 // - percolator::RiskEngine::mark_pnl_for_position (the real mark_pnl calculation)
 // - percolator_prog::verify::base_to_units (the real unit conversion)
 //
-// The proof SHOULD FAIL (finding a counterexample) to demonstrate the bug exists.
+// This section documents the historical bug mechanism and anchors production
+// formulas used by the post-fix proofs below.
 
 // Note: base_to_units is already imported at top of file from percolator_prog::verify
 

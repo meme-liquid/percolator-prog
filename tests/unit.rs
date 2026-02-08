@@ -177,12 +177,13 @@ fn encode_init_market(fixture: &MarketFixture, crank_staleness: u64) -> Vec<u8> 
     encode_u16(500, &mut data); // conf_filter_bps
     data.push(0u8); // invert (0 = no inversion)
     encode_u32(0, &mut data); // unit_scale (0 = no scaling)
+    encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
 
     encode_u64(0, &mut data);
     encode_u64(0, &mut data);
     encode_u64(0, &mut data);
     encode_u64(0, &mut data);
-    encode_u64(64, &mut data);
+    encode_u64(MAX_ACCOUNTS as u64, &mut data);
     encode_u128(0, &mut data);
     encode_u128(0, &mut data);
     encode_u128(0, &mut data);
@@ -203,12 +204,13 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
     encode_u16(500, &mut data); // conf_filter_bps
     data.push(invert);
     encode_u32(unit_scale, &mut data);
+    encode_u64(0, &mut data); // initial_mark_price_e6 (0 for non-Hyperp markets)
 
     encode_u64(0, &mut data);
     encode_u64(0, &mut data);
     encode_u64(0, &mut data);
     encode_u64(0, &mut data);
-    encode_u64(64, &mut data);
+    encode_u64(MAX_ACCOUNTS as u64, &mut data);
     encode_u128(0, &mut data);
     encode_u128(0, &mut data);
     encode_u128(0, &mut data);
@@ -360,7 +362,7 @@ fn encode_init_market_invert(fixture: &MarketFixture, crank_staleness: u64, inve
         assert_eq!(header.version, VERSION);
         
         let engine = zc::engine_ref(&f.slab.data).unwrap();
-        assert_eq!(engine.params.max_accounts, 64);
+        assert_eq!(engine.params.max_accounts, MAX_ACCOUNTS as u64);
     }
 
     #[test]

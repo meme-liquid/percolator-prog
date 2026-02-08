@@ -44,6 +44,11 @@ const TEST_FEED_ID: [u8; 32] = [0xABu8; 32];
 fn program_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/deploy/percolator_prog.so");
+    assert!(
+        path.exists(),
+        "BPF not found at {:?}. Run: cargo build-sbf",
+        path
+    );
     path
 }
 
@@ -2057,6 +2062,11 @@ fn matcher_program_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop(); // Go up from percolator-prog
     path.push("percolator-match/target/deploy/percolator_match.so");
+    assert!(
+        path.exists(),
+        "Matcher BPF not found at {:?}. Run: cd ../percolator-match && cargo build-sbf",
+        path
+    );
     path
 }
 
@@ -4271,6 +4281,30 @@ impl TradeCpiTestEnv {
             .map_err(|e| format!("{:?}", e))
     }
 
+    fn top_up_insurance(&mut self, payer: &Keypair, amount: u64) {
+        let ata = self.create_ata(&payer.pubkey(), amount);
+
+        let mut data = vec![9u8]; // TopUpInsurance instruction tag
+        data.extend_from_slice(&amount.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(payer.pubkey(), true),
+                AccountMeta::new(self.slab, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            data,
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[ix], Some(&payer.pubkey()), &[payer], self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).expect("top_up_insurance failed");
+    }
+
     fn try_withdraw_insurance(&mut self, admin: &Keypair) -> Result<(), String> {
         let admin_ata = self.create_ata(&admin.pubkey(), 0);
         let (vault_pda, _) = Pubkey::find_program_address(&[b"vault", self.slab.as_ref()], &self.program_id);
@@ -5633,7 +5667,8 @@ fn test_premarket_resolution_full_lifecycle() {
     let matcher_prog = env.matcher_program_id;
 
     // Set oracle authority to admin
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
 
     // Create LP with matcher
     let lp = Keypair::new();
@@ -5646,7 +5681,8 @@ fn test_premarket_resolution_full_lifecycle() {
     env.deposit(&user, user_idx, 1_000_000_000); // 1 SOL
 
     // Push initial price and crank
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000); // Price = 1.0
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed"); // Price = 1.0
     env.set_slot(100);
     env.crank();
 
@@ -5666,7 +5702,8 @@ fn test_premarket_resolution_full_lifecycle() {
 
     // Step 1: Admin pushes final resolution price (binary: 1e-6 or 1)
     // Price = 1 (1e-6) means "NO" outcome (essentially zero, but nonzero for force-close)
-    let _ = env.try_push_oracle_price(&admin, 1, 2000); // Final price = 1e-6 (NO)
+    env.try_push_oracle_price(&admin, 1, 2000)
+        .expect("resolution oracle push must succeed"); // Final price = 1e-6 (NO)
     println!("Admin pushed final price: 1e-6 (NO outcome)");
 
     // Step 2: Admin resolves market
@@ -5723,8 +5760,10 @@ fn test_resolved_market_blocks_new_activity() {
     env.init_market_hyperp(1_000_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey());
-    env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("set_oracle_authority should succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("push_oracle_price should succeed");
 
     // Resolve market
     let result = env.try_resolve_market(&admin);
@@ -5778,8 +5817,10 @@ fn test_resolved_market_allows_user_withdrawal() {
     env.init_market_hyperp(1_000_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.try_set_oracle_authority(&admin, &admin.pubkey());
-    env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("set_oracle_authority should succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("push_oracle_price should succeed");
 
     // Create user with deposit
     let user = Keypair::new();
@@ -5848,8 +5889,10 @@ fn test_withdraw_insurance_requires_positions_closed() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     // Create LP and user with positions
     let lp = Keypair::new();
@@ -5862,10 +5905,12 @@ fn test_withdraw_insurance_requires_positions_closed() {
 
     env.set_slot(50);
     env.crank();
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx)
+        .expect("user setup trade must succeed");
 
     // Resolve market WITHOUT cranking to close positions
-    let _ = env.try_push_oracle_price(&admin, 500_000, 2000); // Price = 0.5
+    env.try_push_oracle_price(&admin, 500_000, 2000)
+        .expect("resolution oracle push must succeed"); // Price = 0.5
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved but positions not yet closed");
 
@@ -5905,8 +5950,10 @@ fn test_premarket_paginated_force_close() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     // Create multiple users with positions
     // We'll create 100 users to simulate paginated close (not 4096 for test speed)
@@ -5928,7 +5975,8 @@ fn test_premarket_paginated_force_close() {
         env.deposit(&user, user_idx, 100_000_000); // 0.1 SOL each
 
         // Execute small trade via TradeCpi to create position
-        let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 1_000_000, &matcher_prog, &matcher_ctx);
+        env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 1_000_000, &matcher_prog, &matcher_ctx)
+            .expect("user setup trade must succeed");
         users.push((user, user_idx));
 
         if (i + 1) % 20 == 0 {
@@ -5945,9 +5993,11 @@ fn test_premarket_paginated_force_close() {
         }
     }
     println!("Users with open positions: {}", users_with_positions);
+    assert_eq!(users_with_positions, NUM_USERS, "all setup users must have open positions");
 
     // Resolve market
-    let _ = env.try_push_oracle_price(&admin, 500_000, 2000); // Final price = 0.5
+    env.try_push_oracle_price(&admin, 500_000, 2000)
+        .expect("resolution oracle push must succeed"); // Final price = 0.5
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved");
 
@@ -6011,8 +6061,10 @@ fn test_premarket_binary_outcome_price_zero() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 500_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 500_000, 1000)
+        .expect("initial oracle push must succeed");
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
@@ -6026,11 +6078,13 @@ fn test_premarket_binary_outcome_price_zero() {
     env.crank();
 
     // User bets YES (goes long at 0.5) via TradeCpi
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx)
+        .expect("user setup trade must succeed");
     println!("User went LONG (YES bet) at price 0.5");
 
     // Outcome: NO wins (price = 1e-6, essentially zero but nonzero for force-close)
-    let _ = env.try_push_oracle_price(&admin, 1, 2000);
+    env.try_push_oracle_price(&admin, 1, 2000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved at price = 1e-6 (NO wins)");
 
@@ -6064,8 +6118,10 @@ fn test_premarket_binary_outcome_price_one() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 500_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 500_000, 1000)
+        .expect("initial oracle push must succeed");
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
@@ -6079,11 +6135,13 @@ fn test_premarket_binary_outcome_price_one() {
     env.crank();
 
     // User bets YES (goes long at 0.5) via TradeCpi
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx)
+        .expect("user setup trade must succeed");
     println!("User went LONG (YES bet) at price 0.5");
 
     // Outcome: YES wins (price = 1.0 = 1_000_000 in e6)
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 2000);
+    env.try_push_oracle_price(&admin, 1_000_000, 2000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved at price = 1.0 (YES wins)");
 
@@ -6127,8 +6185,10 @@ fn test_premarket_force_close_cu_benchmark() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     // Create LP with large deposit to handle all trades
     let lp = Keypair::new();
@@ -6144,11 +6204,12 @@ fn test_premarket_force_close_cu_benchmark() {
     let mut users: Vec<(Keypair, u16)> = Vec::new();
 
     println!("Creating {} users with positions...", NUM_USERS);
-    for i in 0..NUM_USERS {
+    for _ in 0..NUM_USERS {
         let user = Keypair::new();
         let user_idx = env.init_user(&user);
         env.deposit(&user, user_idx, 100_000_000); // 0.1 SOL each
-        let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 1_000_000, &matcher_prog, &matcher_ctx);
+        env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 1_000_000, &matcher_prog, &matcher_ctx)
+            .expect("user setup trade must succeed");
         users.push((user, user_idx));
     }
     println!("Created {} users with positions", NUM_USERS);
@@ -6161,9 +6222,11 @@ fn test_premarket_force_close_cu_benchmark() {
         }
     }
     println!("Users with positions: {}", positions_count);
+    assert_eq!(positions_count, NUM_USERS, "all setup users must have open positions");
 
     // Resolve market
-    let _ = env.try_push_oracle_price(&admin, 500_000, 2000);
+    env.try_push_oracle_price(&admin, 500_000, 2000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved");
 
@@ -6274,8 +6337,10 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
     let matcher_prog = env.matcher_program_id;
 
     // Set oracle authority and initial price for hyperp market
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     // Create LP with initial deposit
     let lp = Keypair::new();
@@ -6314,7 +6379,8 @@ fn test_vulnerability_stale_pnl_pos_tot_after_force_close() {
     // Resolve market at 2.0 (2_000_000 e6) - user's long position is profitable
     // This means user has positive PnL = position * (2.0 - 1.0) / 1e6
     env.set_slot(100);
-    let _ = env.try_push_oracle_price(&admin, 2_000_000, 200);
+    env.try_push_oracle_price(&admin, 2_000_000, 200)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
     println!("Market resolved at price 2.0");
 
@@ -22466,8 +22532,10 @@ fn test_binary_market_complete_lifecycle_conservation() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     // Setup: LP + 2 users with opposing positions
     let lp = Keypair::new();
@@ -22486,13 +22554,16 @@ fn test_binary_market_complete_lifecycle_conservation() {
     env.crank();
 
     // Open positions: user_a long, user_b short
-    let _ = env.try_trade_cpi(&user_a, &lp.pubkey(), lp_idx, user_a_idx, 100_000_000, &matcher_prog, &matcher_ctx);
-    let _ = env.try_trade_cpi(&user_b, &lp.pubkey(), lp_idx, user_b_idx, -100_000_000, &matcher_prog, &matcher_ctx);
+    env.try_trade_cpi(&user_a, &lp.pubkey(), lp_idx, user_a_idx, 100_000_000, &matcher_prog, &matcher_ctx)
+        .expect("user_a setup trade must succeed");
+    env.try_trade_cpi(&user_b, &lp.pubkey(), lp_idx, user_b_idx, -100_000_000, &matcher_prog, &matcher_ctx)
+        .expect("user_b setup trade must succeed");
 
     let vault_before = env.vault_balance();
 
     // Resolve at $1.50 (user_a profits, user_b loses)
-    let _ = env.try_push_oracle_price(&admin, 1_500_000, 2000);
+    env.try_push_oracle_price(&admin, 1_500_000, 2000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
     // Force-close all positions (may need multiple cranks for paginated)
@@ -22552,8 +22623,10 @@ fn test_binary_market_close_account_warmup_delay() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     // Setup: LP + user with a long position
     let lp = Keypair::new();
@@ -22568,11 +22641,13 @@ fn test_binary_market_close_account_warmup_delay() {
     env.crank();
 
     // Open long position
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx)
+        .expect("user setup trade must succeed");
     assert_ne!(env.read_account_position(user_idx), 0, "should have position");
 
     // Resolve at higher price (user profits)
-    let _ = env.try_push_oracle_price(&admin, 1_500_000, 2000);
+    env.try_push_oracle_price(&admin, 1_500_000, 2000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
     // Force-close
@@ -22628,8 +22703,10 @@ fn test_binary_market_negative_pnl_close_immediate() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
@@ -22643,13 +22720,15 @@ fn test_binary_market_negative_pnl_close_immediate() {
     env.crank();
 
     // Open long position
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx);
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, 100_000_000, &matcher_prog, &matcher_ctx)
+        .expect("user setup trade must succeed");
 
     let capital_before = env.read_account_capital(user_idx);
     println!("Capital before resolution: {}", capital_before);
 
     // Resolve at LOWER price (user loses)
-    let _ = env.try_push_oracle_price(&admin, 500_000, 2000);
+    env.try_push_oracle_price(&admin, 500_000, 2000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
     env.set_slot(200);
@@ -22683,8 +22762,10 @@ fn test_binary_market_force_close_pnl_correctness() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let matcher_prog = env.matcher_program_id;
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     let lp = Keypair::new();
     let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
@@ -22699,7 +22780,8 @@ fn test_binary_market_force_close_pnl_correctness() {
 
     // Open position
     let trade_size: i128 = 100_000_000;
-    let _ = env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, trade_size, &matcher_prog, &matcher_ctx);
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, trade_size, &matcher_prog, &matcher_ctx)
+        .expect("user setup trade must succeed");
 
     let position = env.read_account_position(user_idx);
     let pnl_before = env.read_account_pnl(user_idx);
@@ -22715,7 +22797,8 @@ fn test_binary_market_force_close_pnl_correctness() {
 
     // Resolve at $2.00
     let settlement_price: u64 = 2_000_000;
-    let _ = env.try_push_oracle_price(&admin, settlement_price, 3000);
+    env.try_push_oracle_price(&admin, settlement_price, 3000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
     env.set_slot(200);
@@ -22753,8 +22836,10 @@ fn test_binary_market_force_close_zero_position_noop() {
     env.init_market_hyperp(1_000_000);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     // Create user with deposit but NO position
     let user = Keypair::new();
@@ -22796,7 +22881,8 @@ fn test_admin_force_close_account_happy_path() {
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
 
     // Create LP and user with positions
     let mp = env.matcher_program_id;
@@ -22808,7 +22894,8 @@ fn test_admin_force_close_account_happy_path() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 1_000_000_000);
 
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
     env.set_slot(100);
     env.crank();
 
@@ -22817,7 +22904,8 @@ fn test_admin_force_close_account_happy_path() {
     assert!(result.is_ok(), "Trade should succeed: {:?}", result);
 
     // Resolve market
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 2000);
+    env.try_push_oracle_price(&admin, 1_000_000, 2000)
+        .expect("resolution oracle push must succeed");
     env.try_resolve_market(&admin).unwrap();
 
     // Crank to force-close positions
@@ -22850,8 +22938,10 @@ fn test_admin_force_close_account_requires_resolved() {
 
     env.init_market_hyperp(1_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
-    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("oracle authority setup must succeed");
+    env.try_push_oracle_price(&admin, 1_000_000, 1000)
+        .expect("initial oracle push must succeed");
 
     let user = Keypair::new();
     let user_idx = env.init_user(&user);
@@ -23267,3 +23357,327 @@ fn test_honest_participants_full_lifecycle() {
     println!("HONEST PARTICIPANTS FULL LIFECYCLE: PASSED");
 }
 
+// ============================================================================
+// Honest user lifecycle tests for all market types
+// ============================================================================
+
+/// Standard Pyth market: user deposits, trades (long), price goes up, flattens, closes account.
+/// warmup_period_slots=0 so PnL converts instantly.
+#[test]
+fn test_honest_user_standard_market_profitable_close() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // Top up insurance to prevent force-realize mode (insurance=0 <= threshold=0 triggers it)
+    let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&payer, 1);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
+
+    // Open long position at $138
+    let size: i128 = 100_000;
+    env.trade(&user, &lp, lp_idx, user_idx, size);
+    assert_eq!(env.read_account_position(user_idx), size);
+
+    // Price goes up (138 → 150), crank to settle mark-to-oracle
+    env.set_slot_and_price(200, 150_000_000);
+    env.crank();
+    assert_eq!(env.read_account_position(user_idx), size, "Crank should not change position");
+
+    // User flattens
+    env.trade(&user, &lp, lp_idx, user_idx, -size);
+    assert_eq!(env.read_account_position(user_idx), 0, "User should be flat");
+
+    // Crank to settle final state
+    env.set_slot_and_price(300, 150_000_000);
+    env.crank();
+
+    let vault_before = env.vault_balance();
+
+    // Close account — warmup_period=0 so PnL converts instantly
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "Profitable user should close account: {:?}", result);
+
+    let vault_after = env.vault_balance();
+    assert!(vault_after < vault_before, "Vault should decrease (capital returned to user)");
+    println!("Standard market profitable user: vault {} → {} (delta={})",
+        vault_before, vault_after, vault_before - vault_after);
+
+    println!("HONEST USER STANDARD MARKET PROFITABLE CLOSE: PASSED");
+}
+
+/// Standard Pyth market: user deposits, trades (long), price drops, flattens, closes.
+/// User loses money but can still close and get remaining capital.
+#[test]
+fn test_honest_user_standard_market_losing_close() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&payer, 1);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
+
+    // Open long at $138
+    let size: i128 = 100_000;
+    env.trade(&user, &lp, lp_idx, user_idx, size);
+
+    // Price drops (138 → 120), crank to settle mark
+    env.set_slot_and_price(200, 120_000_000);
+    env.crank();
+
+    // User flattens
+    env.trade(&user, &lp, lp_idx, user_idx, -size);
+    assert_eq!(env.read_account_position(user_idx), 0, "User should be flat");
+
+    env.set_slot_and_price(300, 120_000_000);
+    env.crank();
+
+    let vault_before = env.vault_balance();
+
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "Losing user should still close account: {:?}", result);
+
+    let vault_after = env.vault_balance();
+    assert!(vault_after < vault_before, "Vault should decrease (remaining capital returned)");
+    println!("Standard market losing user: vault {} → {} (delta={})",
+        vault_before, vault_after, vault_before - vault_after);
+
+    println!("HONEST USER STANDARD MARKET LOSING CLOSE: PASSED");
+}
+
+/// Standard market with warmup: profitable user must wait for warmup before closing.
+/// Uses a larger position (1M) to generate meaningful PnL that takes time to vest.
+#[test]
+fn test_honest_user_standard_market_warmup_close() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_warmup(0, 1000); // warmup_period_slots = 1000
+
+    let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&payer, 1);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
+
+    // Open long at $138 with larger position for meaningful PnL
+    let size: i128 = 1_000_000;
+    env.trade(&user, &lp, lp_idx, user_idx, size);
+
+    // Price goes up (138 → 150), crank to settle mark-to-oracle
+    // PnL = 1M * (150-138) * 1e6 / 1e6 = 12M lamports
+    env.set_slot_and_price(100, 150_000_000);
+    env.crank();
+
+    // User flattens at slot 100 — PnL realized, warmup starts
+    env.trade(&user, &lp, lp_idx, user_idx, -size);
+    assert_eq!(env.read_account_position(user_idx), 0);
+
+    // Advance only 50 slots (warmup needs 1000) and crank
+    env.set_slot_and_price(150, 150_000_000);
+    env.crank();
+
+    // Try close — should fail (warmup far from complete, most PnL still unvested)
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_err(), "CloseAccount should be blocked by warmup (only 50/1000 slots)");
+    println!("CloseAccount blocked by warmup as expected (50/1000 slots)");
+
+    // Advance past warmup period (1000+ slots after warmup start) and crank
+    env.set_slot_and_price(1200, 150_000_000);
+    env.crank();
+
+    // Now close should succeed — warmup fully elapsed
+    let result2 = env.try_close_account(&user, user_idx);
+    assert!(result2.is_ok(), "User should close after warmup: {:?}", result2);
+    println!("User closed after warmup period elapsed (1200/1000 slots)");
+
+    println!("HONEST USER STANDARD MARKET WARMUP CLOSE: PASSED");
+}
+
+/// Inverted Pyth market: user can close account after trading.
+#[test]
+fn test_honest_user_inverted_market_close() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(1);
+
+    let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&payer, 1);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
+
+    // Trade at inverted price (~$138 → inverted ~7246 internally)
+    let size: i128 = 100_000;
+    env.trade(&user, &lp, lp_idx, user_idx, size);
+    assert_eq!(env.read_account_position(user_idx), size);
+
+    env.set_slot(200);
+    env.crank();
+
+    // Flatten
+    env.trade(&user, &lp, lp_idx, user_idx, -size);
+    assert_eq!(env.read_account_position(user_idx), 0);
+
+    env.set_slot(300);
+    env.crank();
+
+    let vault_before = env.vault_balance();
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "User should close on inverted market: {:?}", result);
+
+    let vault_after = env.vault_balance();
+    assert!(vault_after < vault_before, "Capital should be returned");
+
+    println!("HONEST USER INVERTED MARKET CLOSE: PASSED");
+}
+
+/// TradeCpi hyperp market (non-resolution): user trades via CPI, flattens, closes.
+#[test]
+fn test_honest_user_hyperp_trade_flatten_close() {
+    let Some(mut env) = TradeCpiTestEnv::new() else {
+        println!("SKIP: Programs not found");
+        return;
+    };
+
+    env.init_market_hyperp(1_000_000); // mark = 1.0
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    let mp = env.matcher_program_id;
+    let _ = env.try_set_oracle_authority(&admin, &admin.pubkey());
+
+    // Top up insurance to prevent force-realize mode
+    let payer = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.top_up_insurance(&payer, 1);
+
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &mp);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
+
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 1000);
+    env.set_slot(100);
+    env.crank();
+
+    // User buys (small position relative to capital)
+    let size: i128 = 100_000;
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, size, &mp, &matcher_ctx).unwrap();
+    assert_eq!(env.read_account_position(user_idx), size, "User should have position");
+
+    // Crank at same price
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 2000);
+    env.set_slot(200);
+    env.crank();
+
+    // User sells to flatten
+    env.try_trade_cpi(&user, &lp.pubkey(), lp_idx, user_idx, -size, &mp, &matcher_ctx).unwrap();
+    assert_eq!(env.read_account_position(user_idx), 0, "User should be flat");
+
+    // Crank to settle
+    let _ = env.try_push_oracle_price(&admin, 1_000_000, 3000);
+    env.set_slot(300);
+    env.crank();
+
+    // Close account
+    let vault_before = env.vault_balance();
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "User should close on hyperp market: {:?}", result);
+
+    let vault_after = env.vault_balance();
+    assert!(vault_after < vault_before, "Capital should be returned");
+    println!("Hyperp non-resolution: vault {} → {}", vault_before, vault_after);
+
+    println!("HONEST USER HYPERP TRADE FLATTEN CLOSE: PASSED");
+}
+
+/// Full lifecycle test: both LP and user close on standard market, then close slab.
+/// No insurance is topped up, and no crank runs between trades (avoiding force-realize mode).
+#[test]
+fn test_honest_participants_standard_market_full_lifecycle() {
+    let path = program_path();
+    if !path.exists() {
+        println!("SKIP: BPF not found");
+        return;
+    }
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000); // 100 SOL
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000); // 10 SOL
+
+    // Trade and immediately flatten (no crank needed, PnL stays zero at same price)
+    let size: i128 = 100_000;
+    env.trade(&user, &lp, lp_idx, user_idx, size);
+    assert_eq!(env.read_account_position(user_idx), size);
+
+    env.trade(&user, &lp, lp_idx, user_idx, -size);
+    assert_eq!(env.read_account_position(user_idx), 0);
+    assert_eq!(env.read_account_position(lp_idx), 0);
+
+    // Close both accounts (PnL=0, no warmup issue)
+    let result = env.try_close_account(&user, user_idx);
+    assert!(result.is_ok(), "User should close: {:?}", result);
+
+    let result = env.try_close_account(&lp, lp_idx);
+    assert!(result.is_ok(), "LP should close: {:?}", result);
+
+    assert_eq!(env.read_num_used_accounts(), 0, "All accounts closed");
+
+    // Close slab (insurance=0, all accounts closed)
+    let result = env.try_close_slab();
+    assert!(result.is_ok(), "CloseSlab should succeed: {:?}", result);
+
+    println!("HONEST PARTICIPANTS STANDARD MARKET FULL LIFECYCLE: PASSED");
+}

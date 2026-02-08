@@ -54,6 +54,11 @@ const BENCHMARK_FEED_ID: [u8; 32] = [0xABu8; 32];
 fn program_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/deploy/percolator_prog.so");
+    assert!(
+        path.exists(),
+        "BPF not found at {:?}. Run: cargo build-sbf",
+        path
+    );
     path
 }
 
@@ -116,6 +121,7 @@ fn encode_init_market_with_params(
     data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
     data.push(0u8); // invert (0 = no inversion)
     data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale (0 = no scaling)
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6 (0 for non-Hyperp markets)
     // RiskParams
     data.extend_from_slice(&warmup_period_slots.to_le_bytes());
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps (5%)
