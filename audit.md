@@ -1,6 +1,8 @@
 # AUDIT: percolator-prog — Security Audit & Formal Verification Report
 
+
 <!--
+2026-02-07
   CONTEXT FOR AI/LLM READERS:
   This is a comprehensive security audit of percolator-prog, a Solana on-chain
   perpetual futures protocol. The audit covers:
