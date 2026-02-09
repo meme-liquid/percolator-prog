@@ -1,360 +1,393 @@
-# Percolator-prog Formal Verification Audit
+# AUDIT: percolator-prog — Kani Formal Verification Results
 
-## Kani Proofs Summary
+<!--
+  CONTEXT FOR AI/LLM READERS:
+  This file documents the results of Kani formal verification harnesses for
+  percolator-prog, a Solana on-chain perpetual futures protocol.
+  
+  Kani is a model checker for Rust that uses bounded verification to prove
+  properties about code. Each "harness" is a function that asserts a property
+  over symbolic (arbitrary) inputs. If Kani reports "passed", the property
+  holds for ALL inputs within the specified bounds.
+  
+  IMPORTANT: These proofs cover the PROGRAM WRAPPER (account validation,
+  CPI logic, nonce management, unit conversions). The underlying RiskEngine
+  crate is NOT modeled — its behavior is assumed correct.
+  
+  NON-VACUITY: Vacuous proofs (trivially true assertions, identity tests,
+  structural tautologies) were identified and removed in the 2026-02-06 cleanup.
+  Remaining proofs have been verified as non-vacuous.
+-->
 
-**Date:** 2026-02-06
-**Kani Version:** 0.66.0
-**Total Proofs:** 143
-**Passed:** 143
-**Failed:** 0
+## metadata
 
-## Proof Categories
+```yaml
+kani_version: 0.66.0
+date: 2026-02-06
+total_harnesses: 143
+passed: 143
+failed: 0
+scope: program-wrapper only (not risk engine internals)
+bounded_params:
+  KANI_MAX_SCALE: 64
+  KANI_MAX_QUOTIENT: 4096
+  price_base_bound: KANI_MAX_QUOTIENT * unit_scale
+```
 
-These proofs verify **program-level** security properties.
-Risk engine internals are NOT modeled - only wrapper authorization, binding logic, and unit conversions.
+---
 
-### A. Matcher ABI Validation (13 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 1 | kani_matcher_rejects_wrong_abi_version | Wrong ABI version rejected |
-| 2 | kani_matcher_rejects_missing_valid_flag | Missing VALID flag rejected |
-| 3 | kani_matcher_rejects_rejected_flag | REJECTED flag causes rejection |
-| 4 | kani_matcher_rejects_wrong_req_id | Mismatched req_id rejected |
-| 5 | kani_matcher_rejects_wrong_lp_account_id | Mismatched lp_account_id rejected |
-| 6 | kani_matcher_rejects_wrong_oracle_price | Mismatched oracle_price rejected |
-| 7 | kani_matcher_rejects_nonzero_reserved | Non-zero reserved rejected |
-| 8 | kani_matcher_rejects_zero_exec_price | Zero exec_price rejected |
-| 9 | kani_matcher_zero_size_requires_partial_ok | Zero size needs PARTIAL_OK |
-| 10 | kani_matcher_rejects_exec_size_exceeds_req | exec_size > req_size rejected |
-| 11 | kani_matcher_rejects_sign_mismatch | Sign mismatch rejected |
-| 53 | kani_matcher_zero_size_with_partial_ok_accepted | Zero size with PARTIAL_OK accepted |
-| 79 | kani_min_abs_boundary_rejected | i128::MIN boundary handled correctly |
+## proof-categories
 
-### B. Matcher Acceptance Tests (3 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 80 | kani_matcher_accepts_minimal_valid_nonzero_exec | Minimal valid inputs accepted |
-| 81 | kani_matcher_accepts_exec_size_equal_req_size | exec_size == req_size accepted |
-| 82 | kani_matcher_accepts_partial_fill_with_flag | Partial fill with PARTIAL_OK accepted |
+### A. Matcher ABI validation (13 proofs)
 
-### C. Owner/Signer Enforcement (2 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 12 | kani_owner_mismatch_rejected | Owner != signer -> rejected |
-| 13 | kani_owner_match_accepted | Owner == signer -> accepted |
+These prove that the program correctly rejects invalid matcher responses. The matcher returns a 64-byte struct after CPI — every field must match the expected values.
 
-### D. Admin Authorization (3 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 14 | kani_admin_mismatch_rejected | Admin != signer -> rejected |
-| 15 | kani_admin_match_accepted | Admin == signer -> accepted |
-| 16 | kani_admin_burned_disables_ops | Admin == [0;32] -> all ops disabled |
+| id | harness | property |
+|----|---------|----------|
+| 1 | `kani_matcher_rejects_wrong_abi_version` | wrong ABI version → reject |
+| 2 | `kani_matcher_rejects_missing_valid_flag` | missing VALID flag → reject |
+| 3 | `kani_matcher_rejects_rejected_flag` | REJECTED flag present → reject |
+| 4 | `kani_matcher_rejects_wrong_req_id` | req_id mismatch → reject |
+| 5 | `kani_matcher_rejects_wrong_lp_account_id` | lp_account_id mismatch → reject |
+| 6 | `kani_matcher_rejects_wrong_oracle_price` | oracle_price mismatch → reject |
+| 7 | `kani_matcher_rejects_nonzero_reserved` | nonzero reserved field → reject |
+| 8 | `kani_matcher_rejects_zero_exec_price` | zero execution price → reject |
+| 9 | `kani_matcher_zero_size_requires_partial_ok` | zero size without PARTIAL_OK → reject |
+| 10 | `kani_matcher_rejects_exec_size_exceeds_req` | exec > requested size → reject |
+| 11 | `kani_matcher_rejects_sign_mismatch` | sign(exec) != sign(req) → reject |
+| 53 | `kani_matcher_zero_size_with_partial_ok_accepted` | zero size + PARTIAL_OK → accept |
+| 79 | `kani_min_abs_boundary_rejected` | i128::MIN boundary → correctly handled |
 
-### E. CPI Identity Binding (2 proofs) - CRITICAL
-| # | Harness | Property |
-|---|---------|----------|
-| 17 | kani_matcher_identity_mismatch_rejected | LP prog/ctx != provided -> rejected |
-| 18 | kani_matcher_identity_match_accepted | LP prog/ctx == provided -> accepted |
+### B. Matcher acceptance (3 proofs)
 
-### F. Matcher Account Shape Validation (5 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 19 | kani_matcher_shape_rejects_non_executable_prog | Non-executable program rejected |
-| 20 | kani_matcher_shape_rejects_executable_ctx | Executable context rejected |
-| 21 | kani_matcher_shape_rejects_wrong_ctx_owner | Context not owned by program rejected |
-| 22 | kani_matcher_shape_rejects_short_ctx | Insufficient context length rejected |
-| 23 | kani_matcher_shape_valid_accepted | Valid shape accepted |
+| id | harness | property |
+|----|---------|----------|
+| 80 | `kani_matcher_accepts_minimal_valid_nonzero_exec` | minimal valid inputs → accept |
+| 81 | `kani_matcher_accepts_exec_size_equal_req_size` | exec == req size → accept |
+| 82 | `kani_matcher_accepts_partial_fill_with_flag` | partial + PARTIAL_OK → accept |
 
-### G. PDA Key Matching (2 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 24 | kani_pda_mismatch_rejected | Expected != provided key -> rejected |
-| 25 | kani_pda_match_accepted | Expected == provided key -> accepted |
+### C. Owner/signer enforcement (2 proofs)
 
-### H. Nonce Monotonicity (3 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 26 | kani_nonce_unchanged_on_failure | Failure -> nonce unchanged |
-| 27 | kani_nonce_advances_on_success | Success -> nonce += 1 |
-| 28 | kani_nonce_wraps_at_max | u64::MAX -> wraps to 0 |
+| id | harness | property |
+|----|---------|----------|
+| 12 | `kani_owner_mismatch_rejected` | owner != signer → reject |
+| 13 | `kani_owner_match_accepted` | owner == signer → accept |
 
-### I. CPI Uses exec_size (1 proof) - CRITICAL
-| # | Harness | Property |
-|---|---------|----------|
-| 29 | kani_cpi_uses_exec_size | CPI uses exec_size, not requested size |
+### D. Admin authorization (3 proofs)
 
-### J. Gate Activation Logic (3 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 30 | kani_gate_inactive_when_threshold_zero | threshold=0 -> gate inactive |
-| 31 | kani_gate_inactive_when_balance_exceeds | balance > threshold -> gate inactive |
-| 32 | kani_gate_active_when_conditions_met | threshold>0 && balance<=threshold -> gate active |
+| id | harness | property |
+|----|---------|----------|
+| 14 | `kani_admin_mismatch_rejected` | admin != signer → reject |
+| 15 | `kani_admin_match_accepted` | admin == signer → accept |
+| 16 | `kani_admin_burned_disables_ops` | admin == [0;32] → all ops permanently disabled |
 
-### K. Per-Instruction Authorization (4 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 33 | kani_single_owner_mismatch_rejected | Single-owner instruction rejects on mismatch |
-| 34 | kani_single_owner_match_accepted | Single-owner instruction accepts on match |
-| 35 | kani_trade_rejects_user_mismatch | Trade rejects when user owner mismatch |
-| 36 | kani_trade_rejects_lp_mismatch | Trade rejects when LP owner mismatch |
+### E. CPI identity binding (2 proofs) — CRITICAL
 
-### L. TradeCpi Decision Coupling (14 proofs) - CRITICAL
-| # | Harness | Property |
-|---|---------|----------|
-| 37 | kani_tradecpi_rejects_non_executable_prog | Bad shape (non-exec prog) -> reject |
-| 38 | kani_tradecpi_rejects_executable_ctx | Bad shape (exec ctx) -> reject |
-| 39 | kani_tradecpi_rejects_pda_mismatch | PDA mismatch -> reject |
-| 40 | kani_tradecpi_rejects_user_auth_failure | User auth failure -> reject |
-| 41 | kani_tradecpi_rejects_lp_auth_failure | LP auth failure -> reject |
-| 42 | kani_tradecpi_rejects_identity_mismatch | Identity mismatch -> reject |
-| 43 | kani_tradecpi_rejects_abi_failure | ABI failure -> reject |
-| 44 | kani_tradecpi_rejects_gate_risk_increase | Gate active + risk increase -> reject |
-| 45 | kani_tradecpi_allows_gate_risk_decrease | Gate active + risk decrease -> accept |
-| 46 | kani_tradecpi_reject_nonce_unchanged | Reject -> nonce unchanged |
-| 47 | kani_tradecpi_accept_increments_nonce | Accept -> nonce += 1 |
-| 48 | kani_tradecpi_accept_uses_exec_size | Accept -> uses exec_size |
-| 54 | kani_tradecpi_rejects_ctx_owner_mismatch | Context not owned by program -> reject |
-| 55 | kani_tradecpi_rejects_ctx_len_short | Context length insufficient -> reject |
+Proves that CPI only executes if the provided matcher program/context match the LP's registered ones.
 
-### M. TradeNoCpi Decision Coupling (4 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 49 | kani_tradenocpi_rejects_user_auth_failure | User auth failure -> reject |
-| 50 | kani_tradenocpi_rejects_lp_auth_failure | LP auth failure -> reject |
-| 51 | kani_tradenocpi_rejects_gate_risk_increase | Gate active + risk increase -> reject |
-| 52 | kani_tradenocpi_accepts_valid | All checks pass -> accept |
+| id | harness | property |
+|----|---------|----------|
+| 17 | `kani_matcher_identity_mismatch_rejected` | prog/ctx != registered → reject |
+| 18 | `kani_matcher_identity_match_accepted` | prog/ctx == registered → accept |
 
-### N. Universal Nonce Properties (2 proofs) - CRITICAL
-| # | Harness | Property |
-|---|---------|----------|
-| 56 | kani_tradecpi_any_reject_nonce_unchanged | ANY rejection -> nonce unchanged |
-| 57 | kani_tradecpi_any_accept_increments_nonce | ANY acceptance -> nonce += 1 |
+### F. Matcher account shape validation (5 proofs)
 
-### O. Account Validation Helpers (1 consolidated proof)
-| # | Harness | Property |
-|---|---------|----------|
-| 58 | kani_len_ok_universal | len_ok(actual, need) = (actual >= need) for all values |
+| id | harness | property |
+|----|---------|----------|
+| 19 | `kani_matcher_shape_rejects_non_executable_prog` | non-executable program → reject |
+| 20 | `kani_matcher_shape_rejects_executable_ctx` | executable context → reject |
+| 21 | `kani_matcher_shape_rejects_wrong_ctx_owner` | context not owned by program → reject |
+| 22 | `kani_matcher_shape_rejects_short_ctx` | context too small → reject |
+| 23 | `kani_matcher_shape_valid_accepted` | valid shape → accept |
 
-### P. LP PDA Shape Validation (4 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 59 | kani_lp_pda_shape_valid | Valid LP PDA shape accepted |
-| 60 | kani_lp_pda_rejects_wrong_owner | Non-system-owned LP PDA rejected |
-| 61 | kani_lp_pda_rejects_has_data | LP PDA with data rejected |
-| 62 | kani_lp_pda_rejects_funded | Funded LP PDA rejected |
+### G. PDA key matching (2 proofs)
 
-### Q. Oracle Key Validation (2 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 63 | kani_oracle_feed_id_match | Matching oracle feed IDs accepted |
-| 64 | kani_oracle_feed_id_mismatch | Mismatched oracle feed IDs rejected |
+| id | harness | property |
+|----|---------|----------|
+| 24 | `kani_pda_mismatch_rejected` | derived != provided → reject |
+| 25 | `kani_pda_match_accepted` | derived == provided → accept |
 
-### R. Slab Shape Validation (2 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 65 | kani_slab_shape_valid | Valid slab shape accepted |
-| 66 | kani_slab_shape_invalid | Invalid slab shape rejected |
+### H. Nonce monotonicity (3 proofs)
 
-### S. Simple Decision Functions (8 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 67 | kani_decide_single_owner_accepts | Auth ok -> accept |
-| 68 | kani_decide_single_owner_rejects | Auth fail -> reject |
-| 69 | kani_decide_crank_permissionless_accepts | No account -> permissionless crank |
-| 70 | kani_decide_crank_self_accepts | Owner matches -> crank allowed |
-| 71 | kani_decide_crank_rejects_no_idx | Account exists but idx missing -> reject |
-| 72 | kani_decide_crank_rejects_wrong_owner | Owner mismatch -> crank rejected |
-| 73 | kani_decide_admin_accepts | Valid admin -> accept |
-| 74 | kani_decide_admin_rejects | Invalid admin -> reject |
+| id | harness | property |
+|----|---------|----------|
+| 26 | `kani_nonce_unchanged_on_failure` | any failure → nonce unchanged |
+| 27 | `kani_nonce_advances_on_success` | success → nonce += 1 |
+| 28 | `kani_nonce_wraps_at_max` | u64::MAX → wraps to 0 |
 
-### T. ABI Equivalence (1 proof) - CRITICAL
-| # | Harness | Property |
-|---|---------|----------|
-| 75 | kani_abi_ok_equals_validate | verify::abi_ok == validate_matcher_return.is_ok() |
+### I. CPI uses exec_size (1 proof) — CRITICAL
 
-### U. TradeCpi From Real Inputs (5 proofs) - CRITICAL
-| # | Harness | Property |
-|---|---------|----------|
-| 76 | kani_tradecpi_from_ret_any_reject_nonce_unchanged | ANY rejection (real) -> nonce unchanged |
-| 77 | kani_tradecpi_from_ret_any_accept_increments_nonce | ANY acceptance (real) -> nonce += 1 |
-| 78 | kani_tradecpi_from_ret_accept_uses_exec_size | ANY acceptance -> uses exec_size |
-| 121 | kani_tradecpi_from_ret_req_id_is_nonce_plus_one | req_id == nonce + 1 on success |
-| 126 | kani_tradecpi_from_ret_forced_acceptance | Valid inputs force Accept path |
+| id | harness | property |
+|----|---------|----------|
+| 29 | `kani_cpi_uses_exec_size` | engine receives matcher's exec_size, not user's requested size |
 
-### V. Crank Panic Mode Authorization (6 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 83 | kani_crank_panic_requires_admin | Panic crank requires admin |
-| 84 | kani_crank_panic_with_admin_permissionless_accepts | Admin + permissionless -> accept |
-| 85 | kani_crank_panic_burned_admin_rejects | Burned admin -> reject |
-| 86 | kani_crank_no_panic_permissionless_accepts | Non-panic permissionless -> accept |
-| 87 | kani_crank_no_panic_self_crank_rejects_wrong_owner | Self-crank wrong owner -> reject |
-| 88 | kani_crank_no_panic_self_crank_accepts_owner_match | Self-crank correct owner -> accept |
+### J. Gate activation logic (3 proofs)
 
-### W. Haircut Inversion Properties (5 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 89 | kani_invert_zero_returns_raw | h=0 -> raw value unchanged |
-| 90 | kani_invert_nonzero_computes_correctly | h>0 -> correct computation |
-| 91 | kani_invert_zero_raw_returns_none | raw=0 -> returns None |
-| 92 | kani_invert_result_zero_returns_none | result=0 -> returns None |
-| 93 | kani_invert_monotonic | Inversion preserves ordering |
+Risk gate controls whether trades are allowed during low-insurance conditions.
 
-### X. Unit Scale Conversion Properties (11 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 94 | kani_base_to_units_conservation | units + dust == base (no value loss) |
-| 95 | kani_base_to_units_dust_bound | dust < unit_scale (bounded) |
-| 96 | kani_base_to_units_scale_zero | scale=0 -> units=base, dust=0 |
-| 97 | kani_units_roundtrip | base_to_units -> units_to_base roundtrips |
-| 98 | kani_units_to_base_scale_zero | scale=0 -> base=units |
-| 99 | kani_base_to_units_monotonic | Larger base -> larger units |
-| 100 | kani_units_to_base_monotonic_bounded | Larger units -> larger base (bounded) |
-| 101 | kani_base_to_units_monotonic_scale_zero | Monotonic even with scale=0 |
-| 123 | kani_units_roundtrip_exact_when_no_dust | Perfect roundtrip when dust=0 |
-| 132 | kani_unit_conversion_deterministic | Same inputs -> same outputs |
-| 133 | kani_scale_validation_pure | Scale validation is deterministic |
+| id | harness | property |
+|----|---------|----------|
+| 30 | `kani_gate_inactive_when_threshold_zero` | threshold=0 → gate off |
+| 31 | `kani_gate_inactive_when_balance_exceeds` | balance > threshold → gate off |
+| 32 | `kani_gate_active_when_conditions_met` | threshold>0 && balance<=threshold → gate on |
 
-### Y. Withdrawal Alignment Properties (3 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 102 | kani_withdraw_misaligned_rejects | Misaligned withdrawal rejected |
-| 103 | kani_withdraw_aligned_accepts | Aligned withdrawal accepted |
-| 104 | kani_withdraw_scale_zero_always_aligned | scale=0 -> always aligned |
+### K. Per-instruction authorization (4 proofs)
 
-### Z. Dust Sweep Properties (8 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 105 | kani_sweep_dust_conservation | swept + remaining == original |
-| 106 | kani_sweep_dust_rem_bound | Remaining dust bounded |
-| 107 | kani_sweep_dust_below_threshold | Swept dust below threshold |
-| 108 | kani_sweep_dust_scale_zero | scale=0 -> no dust to sweep |
-| 109 | kani_accumulate_dust_saturates | Dust accumulation saturates |
-| 110 | kani_scale_zero_policy_no_dust | scale=0 policy produces no dust |
-| 111 | kani_scale_zero_policy_sweep_complete | scale=0 sweep is complete |
-| 112 | kani_scale_zero_policy_end_to_end | scale=0 end-to-end invariants |
+| id | harness | property |
+|----|---------|----------|
+| 33 | `kani_single_owner_mismatch_rejected` | owner mismatch → single-owner IX rejects |
+| 34 | `kani_single_owner_match_accepted` | owner match → single-owner IX accepts |
+| 35 | `kani_trade_rejects_user_mismatch` | trade: user owner mismatch → reject |
+| 36 | `kani_trade_rejects_lp_mismatch` | trade: LP owner mismatch → reject |
 
-### AA. Universal Rejection Properties (6 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 113 | kani_universal_shape_fail_rejects | ANY shape failure -> reject |
-| 114 | kani_universal_pda_fail_rejects | ANY PDA failure -> reject |
-| 115 | kani_universal_user_auth_fail_rejects | ANY user auth failure -> reject |
-| 116 | kani_universal_lp_auth_fail_rejects | ANY LP auth failure -> reject |
-| 117 | kani_universal_identity_fail_rejects | ANY identity failure -> reject |
-| 118 | kani_universal_abi_fail_rejects | ANY ABI failure -> reject |
+### L. TradeCpi decision coupling (14 proofs) — CRITICAL
 
-### BB. TradeCpi Variant Consistency (2 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 119 | kani_tradecpi_variants_consistent_valid_shape | decide_trade_cpi == decide_trade_cpi_from_ret (valid) |
-| 120 | kani_tradecpi_variants_consistent_invalid_shape | decide_trade_cpi == decide_trade_cpi_from_ret (invalid) |
+Full decision-tree verification for TradeCpi. Every rejection reason is tested individually and proven to reject. Every acceptance is proven to advance nonce and use exec_size.
 
-### CC. Universal Gate/Panic Properties (3 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 122 | kani_universal_gate_risk_increase_rejects | Gate active + risk increase -> reject |
-| 124 | kani_universal_panic_requires_admin | Panic mode requires admin auth |
-| 125 | kani_universal_gate_risk_increase_rejects_from_ret | Gate rejection (real inputs) |
+| id | harness | property |
+|----|---------|----------|
+| 37 | `kani_tradecpi_rejects_non_executable_prog` | bad shape → reject |
+| 38 | `kani_tradecpi_rejects_executable_ctx` | bad shape → reject |
+| 39 | `kani_tradecpi_rejects_pda_mismatch` | PDA wrong → reject |
+| 40 | `kani_tradecpi_rejects_user_auth_failure` | user auth fail → reject |
+| 41 | `kani_tradecpi_rejects_lp_auth_failure` | LP auth fail → reject |
+| 42 | `kani_tradecpi_rejects_identity_mismatch` | identity fail → reject |
+| 43 | `kani_tradecpi_rejects_abi_failure` | ABI fail → reject |
+| 44 | `kani_tradecpi_rejects_gate_risk_increase` | gate active + risk up → reject |
+| 45 | `kani_tradecpi_allows_gate_risk_decrease` | gate active + risk down → accept |
+| 46 | `kani_tradecpi_reject_nonce_unchanged` | reject → nonce unchanged |
+| 47 | `kani_tradecpi_accept_increments_nonce` | accept → nonce += 1 |
+| 48 | `kani_tradecpi_accept_uses_exec_size` | accept → uses exec_size |
+| 54 | `kani_tradecpi_rejects_ctx_owner_mismatch` | ctx owner wrong → reject |
+| 55 | `kani_tradecpi_rejects_ctx_len_short` | ctx too small → reject |
 
-### DD. InitMarket Scale Validation (5 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 127 | kani_init_market_scale_rejects_overflow | Overflow scale rejected |
-| 128 | kani_init_market_scale_zero_ok | scale=0 accepted |
-| 129 | kani_init_market_scale_boundary_ok | scale=MAX_UNIT_SCALE accepted |
-| 130 | kani_init_market_scale_boundary_reject | scale=MAX+1 rejected |
-| 131 | kani_init_market_scale_valid_range | Valid range [0, MAX] accepted |
+### M. TradeNoCpi decision coupling (4 proofs)
 
-### EE. scale_price_e6 Properties (4 proofs)
-| # | Harness | Property |
-|---|---------|----------|
-| 134 | kani_scale_price_e6_zero_result_rejected | Zero result -> None |
-| 135 | kani_scale_price_e6_valid_result | Valid inputs -> Some(price/scale) |
-| 136 | kani_scale_price_e6_identity_for_scale_leq_1 | scale≤1 -> identity |
-| 138 | kani_scale_price_e6_concrete_example | Concrete example: 1_000_000/100=10_000 |
+| id | harness | property |
+|----|---------|----------|
+| 49 | `kani_tradenocpi_rejects_user_auth_failure` | user auth fail → reject |
+| 50 | `kani_tradenocpi_rejects_lp_auth_failure` | LP auth fail → reject |
+| 51 | `kani_tradenocpi_rejects_gate_risk_increase` | gate + risk up → reject |
+| 52 | `kani_tradenocpi_accepts_valid` | all valid → accept |
 
-### FF. scale_price_e6 and base_to_units Consistency (1 proof)
-| # | Harness | Property |
-|---|---------|----------|
-| 137 | kani_scale_price_and_base_to_units_use_same_divisor | Both use /unit_scale |
+### N. Universal nonce properties (2 proofs) — CRITICAL
 
-### GG. clamp_toward_with_dt Rate Limiting (5 proofs) - Bug #9
-| # | Harness | Property |
-|---|---------|----------|
-| 139 | kani_clamp_toward_no_movement_when_dt_zero | dt=0 -> index unchanged |
-| 140 | kani_clamp_toward_no_movement_when_cap_zero | cap=0 -> index unchanged |
-| 141 | kani_clamp_toward_bootstrap_when_index_zero | index=0 -> jumps to mark |
-| 142 | kani_clamp_toward_movement_bounded_concrete | Movement bounded by cap*dt |
-| 143 | kani_clamp_toward_formula_concrete | Formula matches specification |
+These use `kani::any()` for ALL decision inputs, proving nonce behavior is correct regardless of rejection reason.
 
-## Key Security Properties Proven
+| id | harness | property |
+|----|---------|----------|
+| 56 | `kani_tradecpi_any_reject_nonce_unchanged` | ANY rejection → nonce unchanged |
+| 57 | `kani_tradecpi_any_accept_increments_nonce` | ANY acceptance → nonce += 1 |
 
-### Authorization Surface
-1. **Owner checks cannot be bypassed** - Every account operation validates owner == signer
-2. **Admin checks cannot be bypassed** - Admin ops require admin == signer
-3. **Burned admin is permanent** - [0;32] admin disables all admin ops forever
-4. **Crank authorization is correct** - Existing accounts require owner, non-existent allow anyone
-5. **Trade requires both parties** - Both user and LP owners must sign
+### O-P. Account & LP PDA validation (5 proofs)
 
-### CPI Security (CRITICAL)
-1. **Matcher identity binding** - CPI only proceeds if provided program/context match LP registration
-2. **Matcher shape validation** - Program must be executable, context must not be, owner must be program
-3. **exec_size is used** - CPI path uses matcher's exec_size, never the user's requested size
-4. **Identity mismatch rejects even with valid ABI** - Strong adversary model
+| id | harness | property |
+|----|---------|----------|
+| 58 | `kani_len_ok_universal` | len_ok(actual, need) == (actual >= need) for all values |
+| 59-62 | `kani_lp_pda_shape_*` | LP PDA validation: non-system owner, has data, funded → reject |
 
-### State Consistency
-1. **Nonce unchanged on failure** - Any rejection leaves nonce unchanged
-2. **Nonce advances on success** - Successful trade advances nonce by exactly 1
-3. **Nonce wraps correctly** - u64::MAX wraps to 0
+### Q. Oracle key validation (2 proofs)
 
-### Risk Gate Policy
-1. **Gate inactive when threshold=0** - Zero threshold disables gating
-2. **Gate inactive when balance > threshold** - Sufficient funds disable gating
-3. **Risk-increasing trades rejected when gate active** - Anti-DoS protection
-4. **Risk-reducing trades allowed when gate active** - Deleveraging permitted
+| id | harness | property |
+|----|---------|----------|
+| 63 | `kani_oracle_feed_id_match` | matching feed IDs → accept |
+| 64 | `kani_oracle_feed_id_mismatch` | mismatched feed IDs → reject |
 
-### Matcher ABI
-1. **All field mismatches rejected** - ABI version, req_id, lp_account_id, oracle_price, reserved
-2. **Flag semantics enforced** - VALID required, REJECTED causes rejection, PARTIAL_OK for zero size
-3. **Size constraints enforced** - exec_size <= req_size, sign must match
-4. **No overflow on i128::MIN** - Uses unsigned_abs() to avoid panic on extreme values
+### R. Slab shape validation (2 proofs)
 
-### Unit Scale Conversions (NEW)
-1. **Conservation** - base_to_units: units + dust == base
-2. **Dust bounded** - dust < unit_scale always
-3. **Monotonicity** - Larger inputs produce larger outputs
-4. **Roundtrip** - units_to_base(base_to_units(x)) >= x
-5. **Determinism** - Same inputs always produce same outputs
+| id | harness | property |
+|----|---------|----------|
+| 65 | `kani_slab_shape_valid` | valid slab → accept |
+| 66 | `kani_slab_shape_invalid` | invalid slab → reject |
 
-### Hyperp Index Smoothing (Bug #9 Fix)
-1. **No movement when dt=0** - Second crank in same slot can't move index
-2. **No movement when cap=0** - Zero cap means no movement allowed
-3. **Bootstrap allowed** - index=0 can jump to mark (initial price discovery)
-4. **Movement bounded** - |delta| <= cap * dt (rate limiting enforced)
+### S. Simple decision functions (8 proofs)
 
-## Proof Quality Audit (2026-02-06)
+| id | harness | property |
+|----|---------|----------|
+| 67-68 | `kani_decide_single_owner_*` | single-owner accept/reject |
+| 69-72 | `kani_decide_crank_*` | crank auth: permissionless, self-crank, wrong owner |
+| 73-74 | `kani_decide_admin_*` | admin accept/reject |
 
-### Removed Vacuous/Trivial Proofs
-- `kani_reject_has_no_chosen_size` - Structural tautology (Reject has no fields)
-- `kani_signer_ok_*`, `kani_writable_ok_*` - Identity function tests
-- `kani_*_independent_of_scale` - Fake non-interference tests
-- Individual `kani_len_ok_*` - Consolidated into `kani_len_ok_universal`
+### T. ABI equivalence (1 proof) — CRITICAL
 
-### Fixed Proofs
-- `kani_unit_conversion_deterministic` - Now calls function twice, not copy result
-- `kani_tradecpi_from_ret_accept_uses_exec_size` - Forces Accept path with valid req_id
+| id | harness | property |
+|----|---------|----------|
+| 75 | `kani_abi_ok_equals_validate` | `verify::abi_ok == validate_matcher_return.is_ok()` for ALL inputs |
 
-### Bounded Verification
-- `KANI_MAX_SCALE = 64` - Tractable scale values
-- `KANI_MAX_QUOTIENT = 4096` - Tractable quotient values
-- Price/base bounds: `<= KANI_MAX_QUOTIENT * unit_scale` for SAT tractability
+### U. TradeCpi from real inputs (5 proofs) — CRITICAL
 
-## What is NOT Proven
+Tests the full decision path using real `MatcherReturn` struct data (not mock booleans).
 
-- Risk engine internals (LpRiskState, risk metric formula)
-- CPI execution (Solana invoke mechanics)
-- AccountInfo validation (done at runtime by Solana)
-- Actual PDA derivation (Solana's find_program_address)
-- Token transfer correctness (SPL Token program)
-- Arbitrary u64 inputs (bounded for SAT tractability)
+| id | harness | property |
+|----|---------|----------|
+| 76 | `kani_tradecpi_from_ret_any_reject_nonce_unchanged` | ANY rejection (real) → nonce unchanged |
+| 77 | `kani_tradecpi_from_ret_any_accept_increments_nonce` | ANY acceptance (real) → nonce += 1 |
+| 78 | `kani_tradecpi_from_ret_accept_uses_exec_size` | ANY acceptance → uses exec_size |
+| 121 | `kani_tradecpi_from_ret_req_id_is_nonce_plus_one` | req_id == nonce + 1 on success |
+| 126 | `kani_tradecpi_from_ret_forced_acceptance` | valid inputs force Accept path |
+
+### V. Crank panic mode authorization (6 proofs)
+
+| id | harness | property |
+|----|---------|----------|
+| 83-88 | `kani_crank_panic_*` / `kani_crank_no_panic_*` | panic requires admin, permissionless accepts, wrong owner rejects |
+
+### W. Haircut inversion (5 proofs)
+
+| id | harness | property |
+|----|---------|----------|
+| 89-93 | `kani_invert_*` | zero handling, correct computation, monotonicity |
+
+### X. Unit scale conversions (11 proofs)
+
+| id | harness | property |
+|----|---------|----------|
+| 94 | `kani_base_to_units_conservation` | units + dust == base (no value loss) |
+| 95 | `kani_base_to_units_dust_bound` | dust < unit_scale |
+| 96 | `kani_base_to_units_scale_zero` | scale=0 → units=base, dust=0 |
+| 97 | `kani_units_roundtrip` | base_to_units → units_to_base roundtrips |
+| 98 | `kani_units_to_base_scale_zero` | scale=0 → base=units |
+| 99 | `kani_base_to_units_monotonic` | larger base → larger units |
+| 100 | `kani_units_to_base_monotonic_bounded` | larger units → larger base |
+| 101 | `kani_base_to_units_monotonic_scale_zero` | monotonic at scale=0 |
+| 123 | `kani_units_roundtrip_exact_when_no_dust` | perfect roundtrip when dust=0 |
+| 132 | `kani_unit_conversion_deterministic` | same inputs → same outputs |
+| 133 | `kani_scale_validation_pure` | scale validation is deterministic |
+
+### Y. Withdrawal alignment (3 proofs)
+
+| id | harness | property |
+|----|---------|----------|
+| 102 | `kani_withdraw_misaligned_rejects` | misaligned → reject |
+| 103 | `kani_withdraw_aligned_accepts` | aligned → accept |
+| 104 | `kani_withdraw_scale_zero_always_aligned` | scale=0 → always aligned |
+
+### Z. Dust sweep (8 proofs)
+
+| id | harness | property |
+|----|---------|----------|
+| 105 | `kani_sweep_dust_conservation` | swept + remaining == original |
+| 106 | `kani_sweep_dust_rem_bound` | remaining bounded |
+| 107 | `kani_sweep_dust_below_threshold` | swept below threshold |
+| 108-112 | `kani_*_scale_zero_*` | scale=0 edge cases |
+
+### AA. Universal rejection (6 proofs)
+
+Prove that any single check failure causes overall rejection, regardless of other inputs.
+
+| id | harness | property |
+|----|---------|----------|
+| 113-118 | `kani_universal_*_fail_rejects` | shape/PDA/user/LP/identity/ABI fail → reject |
+
+### BB-CC. Variant consistency & gate/panic properties (5 proofs)
+
+| id | harness | property |
+|----|---------|----------|
+| 119-120 | `kani_tradecpi_variants_consistent_*` | decide_trade_cpi == decide_trade_cpi_from_ret |
+| 122 | `kani_universal_gate_risk_increase_rejects` | gate + risk up → reject |
+| 124 | `kani_universal_panic_requires_admin` | panic → admin required |
+| 125 | `kani_universal_gate_risk_increase_rejects_from_ret` | gate rejection (real inputs) |
+
+### DD. InitMarket scale validation (5 proofs)
+
+| id | harness | property |
+|----|---------|----------|
+| 127-131 | `kani_init_market_scale_*` | overflow rejected, 0 ok, MAX ok, MAX+1 rejected, valid range |
+
+### EE-FF. scale_price_e6 properties (5 proofs)
+
+| id | harness | property |
+|----|---------|----------|
+| 134-138 | `kani_scale_price_e6_*` | zero→None, valid→Some, identity for scale≤1, concrete example, consistency |
+
+### GG. clamp_toward_with_dt rate limiting (5 proofs)
+
+Oracle price smoothing — prevents sudden index jumps.
+
+| id | harness | property |
+|----|---------|----------|
+| 139 | `kani_clamp_toward_no_movement_when_dt_zero` | dt=0 → no movement |
+| 140 | `kani_clamp_toward_no_movement_when_cap_zero` | cap=0 → no movement |
+| 141 | `kani_clamp_toward_bootstrap_when_index_zero` | index=0 → jump to mark |
+| 142 | `kani_clamp_toward_movement_bounded_concrete` | |delta| <= cap * dt |
+| 143 | `kani_clamp_toward_formula_concrete` | formula matches specification |
+
+---
+
+## proven-security-properties
+
+### authorization
+
+- owner checks cannot be bypassed (proofs 12-13, 33-36)
+- admin checks cannot be bypassed (proofs 14-16, 73-74)
+- burned admin (all-zeros) permanently disables all admin ops (proof 16)
+- crank authorization: existing accounts require owner match, non-existent allow anyone (proofs 69-72)
+- trades require both user AND LP owner signatures (proofs 35-36)
+
+### CPI security
+
+- matcher identity binding: CPI only if program/context match LP registration (proofs 17-18)
+- matcher shape: program executable, context not executable, context owned by program (proofs 19-23)
+- exec_size is used for engine call, never user's requested size (proof 29)
+- identity mismatch rejects even with valid ABI (proof 42)
+
+### state consistency
+
+- nonce unchanged on ANY failure (proofs 26, 46, 56, 76)
+- nonce advances by exactly 1 on ANY success (proofs 27, 47, 57, 77)
+- nonce wraps correctly at u64::MAX (proof 28)
+- req_id == nonce + 1 on success (proof 121)
+
+### risk gate
+
+- threshold=0 disables gate (proof 30)
+- sufficient balance disables gate (proof 31)
+- risk-increasing trades rejected when gate active (proofs 32, 44, 51, 122)
+- risk-reducing trades allowed when gate active (proof 45)
+
+### unit conversions
+
+- base_to_units: units + dust == base (conservation, proof 94)
+- dust < unit_scale (bounded, proof 95)
+- roundtrip: units_to_base(base_to_units(x)) >= x (proof 97)
+- monotonicity preserved (proofs 99-101)
+- deterministic (proof 132)
+
+---
+
+## not-proven
+
+These are explicitly OUT OF SCOPE for Kani verification:
+
+- risk engine internals (LpRiskState, risk formulas, PnL math)
+- Solana CPI execution mechanics (invoke_signed behavior)
+- AccountInfo runtime validation (Solana runtime handles this)
+- actual PDA derivation (Solana's find_program_address)
+- SPL Token transfer correctness
+- arbitrary u64 inputs beyond bounded ranges (SAT tractability limit)
+- percolator-match program (separate codebase)
+
+---
+
+## proof-quality
+
+### removed vacuous proofs (2026-02-06 cleanup)
+
+- `kani_reject_has_no_chosen_size` — structural tautology (Reject variant has no fields)
+- `kani_signer_ok_*`, `kani_writable_ok_*` — identity function tests (assert f(x)==x)
+- `kani_*_independent_of_scale` — fake non-interference (compared same value to itself)
+- individual `kani_len_ok_*` — consolidated into universal proof
+
+### fixed proofs
+
+- `kani_unit_conversion_deterministic` — now calls function twice instead of comparing output to copy
+- `kani_tradecpi_from_ret_accept_uses_exec_size` — forces Accept path with valid req_id
+
+### bounding strategy
+
+Kani uses bounded model checking. Symbolic inputs are constrained to tractable ranges:
+- `KANI_MAX_SCALE = 64` for unit_scale values
+- `KANI_MAX_QUOTIENT = 4096` for price/base quotients
+- price and base values bounded by `KANI_MAX_QUOTIENT * unit_scale`
+
+This means proofs hold for ALL values within bounds, but edge cases beyond bounds are unverified.
