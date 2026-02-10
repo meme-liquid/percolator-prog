@@ -1,5 +1,39 @@
 # Percolator (Solana Program)
 
+## Verify
+
+The mainnet deployment can be independently verified by rebuilding from source and comparing binary hashes.
+
+**Program ID:** `DP2EbA2v6rmkmNieZpnjumXosuXQ93r9jyb9eSzzkf1x`
+
+**Verified Commit:** [`da09bd7`](https://github.com/meme-liquid/percolator-prog/tree/da09bd7) (`verified-build` branch)
+
+**Binary Hash:** `56a8e4c962c276e1fc0341c1e5a1588d2a73619d84bb4b4e07852ffc957a50de`
+
+### Reproduce the build
+
+```bash
+# Clone and checkout the verified commit
+git clone https://github.com/meme-liquid/percolator-prog.git
+cd percolator-prog
+git checkout da09bd7
+
+# Deterministic build (requires Docker + solana-verify CLI)
+solana-verify build --library-name percolator_prog --base-image memeliquid/solana-verify:latest
+
+# Compare local build hash
+solana-verify get-executable-hash target/deploy/percolator_prog.so
+
+# Compare on-chain program hash
+solana-verify get-program-hash --url https://api.mainnet-beta.solana.com DP2EbA2v6rmkmNieZpnjumXosuXQ93r9jyb9eSzzkf1x
+```
+
+Both commands should output:
+
+```
+56a8e4c962c276e1fc0341c1e5a1588d2a73619d84bb4b4e07852ffc957a50de
+```
+
 > **⚠️ DISCLAIMER: FOR EDUCATIONAL PURPOSES ONLY**
 >
 > This code has **NOT been audited**. Do NOT use in production or with real funds. This is experimental software provided for learning and testing purposes only. Use at your own risk.
