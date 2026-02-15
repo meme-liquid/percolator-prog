@@ -4558,20 +4558,26 @@ pub mod processor {
                     }
                 }
 
-                // Realloc the account to NEW_SLAB_LEN
+                // Transfer rent difference from admin to slab BEFORE realloc
                 let new_len = crate::constants::NEW_SLAB_LEN;
-                a_slab.realloc(new_len, true)?;
-
-                // Transfer rent difference from admin to slab
                 let rent = solana_program::rent::Rent::default();
                 let new_rent = rent.minimum_balance(new_len);
                 let current_lamports = a_slab.lamports();
                 if new_rent > current_lamports {
                     let diff = new_rent - current_lamports;
-                    // Transfer lamports from admin to slab
-                    **a_admin.try_borrow_mut_lamports()? -= diff;
-                    **a_slab.try_borrow_mut_lamports()? += diff;
+                    // Use System Program CPI to transfer (program can't debit non-owned accounts)
+                    solana_program::program::invoke(
+                        &solana_program::system_instruction::transfer(
+                            a_admin.key,
+                            a_slab.key,
+                            diff,
+                        ),
+                        &[a_admin.clone(), a_slab.clone(), _a_system.clone()],
+                    )?;
                 }
+
+                // Realloc the account to NEW_SLAB_LEN
+                a_slab.realloc(new_len, true)?;
 
                 // ExtParams is zero-initialized by realloc(zero_init=true)
                 // No further initialization needed
