@@ -1270,6 +1270,8 @@ pub mod ix {
             max_long_oi: u128,
             max_short_oi: u128,
         },
+        /// Unresolve market: clear RESOLVED flag so trading can resume. Admin only.
+        UnresolveMarket,
     }
 
     impl Instruction {
@@ -1466,6 +1468,7 @@ pub mod ix {
                         max_short_oi,
                     })
                 }
+                24 => Ok(Instruction::UnresolveMarket),
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -1809,6 +1812,12 @@ pub mod state {
     /// Set the resolved flag.
     pub fn set_resolved(data: &mut [u8]) {
         let flags = read_flags(data) | FLAG_RESOLVED;
+        write_flags(data, flags);
+    }
+
+    /// Clear the resolved flag (unresolve market).
+    pub fn clear_resolved(data: &mut [u8]) {
+        let flags = read_flags(data) & !FLAG_RESOLVED;
         write_flags(data, flags);
     }
 
@@ -4594,6 +4603,27 @@ pub mod processor {
                 ext.max_pnl_vault_bps = max_pnl_vault_bps;
                 ext.max_long_oi = max_long_oi;
                 ext.max_short_oi = max_short_oi;
+            }
+            Instruction::UnresolveMarket => {
+                // Tag 24: Clear RESOLVED flag so trading can resume. Admin only.
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                if !state::is_resolved(&data) {
+                    return Err(ProgramError::InvalidAccountData); // Not resolved
+                }
+
+                state::clear_resolved(&mut data);
             }
         }
         Ok(())
