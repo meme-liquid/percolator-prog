@@ -3350,6 +3350,12 @@ pub mod processor {
                     sol_log_compute_units();
                 }
 
+                // Compute dynamic OI cap: 10x current total OI (same units as position_size)
+                // Engine uses this to gate new position opens when OI is excessive
+                let max_oi_abs = engine.total_open_interest.get()
+                    .saturating_mul(10)
+                    .max(100_000_000_000); // Minimum floor: 100B position-units
+
                 let _outcome = engine
                     .keeper_crank(
                         effective_caller_idx,
@@ -3358,6 +3364,7 @@ pub mod processor {
                         effective_funding_rate,
                         allow_panic != 0,
                         max_pnl_vault_bps,
+                        max_oi_abs,
                     )
                     .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
