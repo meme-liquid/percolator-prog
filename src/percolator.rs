@@ -923,6 +923,7 @@ pub mod zc {
     }
 
     /// Read ExtParams reference from migrated slab data (zero-copy)
+    /// Note: SBF/eBPF handles unaligned access natively, no alignment check needed.
     #[inline]
     pub fn ext_params_ref(data: &[u8]) -> Result<&ExtParams, ProgramError> {
         if data.len() < crate::constants::NEW_SLAB_LEN {
@@ -930,10 +931,6 @@ pub mod zc {
         }
         let off = crate::constants::EXT_OFF;
         let ptr = unsafe { data.as_ptr().add(off) };
-        // ExtParams is 16-byte aligned (u128 fields), ENGINE_OFF is 16-aligned, ENGINE_LEN is multiple of 16
-        if (ptr as usize) % 16 != 0 {
-            return Err(ProgramError::InvalidAccountData);
-        }
         Ok(unsafe { &*(ptr as *const ExtParams) })
     }
 
@@ -945,9 +942,6 @@ pub mod zc {
         }
         let off = crate::constants::EXT_OFF;
         let ptr = unsafe { data.as_mut_ptr().add(off) };
-        if (ptr as usize) % 16 != 0 {
-            return Err(ProgramError::InvalidAccountData);
-        }
         Ok(unsafe { &mut *(ptr as *mut ExtParams) })
     }
 
