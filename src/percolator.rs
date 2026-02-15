@@ -3423,6 +3423,20 @@ pub mod processor {
                     state::write_last_thr_update_slot(&mut data, clock.slot);
                 }
 
+                // --- Dynamic OI cap auto-update (on migrated slabs) ---
+                // Sets max_long_oi = max_short_oi = total_open_interest * 10
+                // This scales with the market and requires no manual intervention
+                if zc::is_migrated(&data) {
+                    // Read OI first (immutable borrow), then write cap (mutable borrow)
+                    let dynamic_cap = zc::engine_ref(&data)
+                        .map(|eng| eng.total_open_interest.get().saturating_mul(10).max(100_000_000_000))
+                        .unwrap_or(100_000_000_000);
+                    if let Ok(ext) = zc::ext_params_mut(&mut data) {
+                        ext.max_long_oi = dynamic_cap;
+                        ext.max_short_oi = dynamic_cap;
+                    }
+                }
+
                 // Write remaining dust if sweep occurred
                 if let Some(dust) = remaining_dust {
                     state::write_dust_base(&mut data, dust);
