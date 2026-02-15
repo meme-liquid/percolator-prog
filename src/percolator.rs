@@ -30,6 +30,13 @@ pub mod constants {
     pub const ENGINE_OFF: usize = align_up(HEADER_LEN + CONFIG_LEN, ENGINE_ALIGN);
     pub const ENGINE_LEN: usize = size_of::<RiskEngine>();
     pub const SLAB_LEN: usize = ENGINE_OFF + ENGINE_LEN;
+
+    // ExtParams: appended after RiskEngine for migrated slabs
+    // ExtParams is 128 bytes, 16-byte aligned (u128 fields)
+    pub const EXT_OFF: usize = SLAB_LEN; // starts right after RiskEngine
+    pub const EXT_LEN: usize = 128;
+    pub const NEW_SLAB_LEN: usize = SLAB_LEN + EXT_LEN;
+
     pub const MATCHER_ABI_VERSION: u32 = 1;
     pub const MATCHER_CONTEXT_PREFIX_LEN: usize = 64;
     pub const MATCHER_CONTEXT_LEN: usize = 320;
@@ -868,6 +875,82 @@ pub mod zc {
     // which stack-allocates the ~6MB struct and causes stack overflow in BPF.
     // Use engine_mut() + init_in_place() instead for initialization.
 
+    // =========================================================================
+    // ExtParams: Extended parameters appended after RiskEngine (migration)
+    // =========================================================================
+
+    /// Extended parameters for migrated slabs (128 bytes, 16-byte aligned).
+    /// Stored at EXT_OFF = SLAB_LEN (immediately after RiskEngine).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct ExtParams {
+        /// Max PnL as bps of c_tot. 0 = disabled. E.g., 2000 = 20%
+        pub max_pnl_vault_bps: u64,        // 8 bytes, offset 0
+        pub _pad0: u64,                     // 8 bytes, offset 8 (alignment)
+        /// Current total long OI (in base units)
+        pub long_oi: u128,                  // 16 bytes, offset 16
+        /// Current total short OI (in base units)
+        pub short_oi: u128,                 // 16 bytes, offset 32
+        /// Max allowed long OI (0 = no cap)
+        pub max_long_oi: u128,              // 16 bytes, offset 48
+        /// Max allowed short OI (0 = no cap)
+        pub max_short_oi: u128,             // 16 bytes, offset 64
+        /// Reserved for future use
+        pub _reserved: [u8; 48],            // 48 bytes, offset 80
+    }
+
+    // Compile-time size check
+    const _: () = assert!(core::mem::size_of::<ExtParams>() == crate::constants::EXT_LEN);
+
+    impl Default for ExtParams {
+        fn default() -> Self {
+            Self {
+                max_pnl_vault_bps: 0,
+                _pad0: 0,
+                long_oi: 0,
+                short_oi: 0,
+                max_long_oi: 0,
+                max_short_oi: 0,
+                _reserved: [0; 48],
+            }
+        }
+    }
+
+    /// Check if a slab has been migrated to the new layout (has ExtParams space)
+    #[inline]
+    pub fn is_migrated(data: &[u8]) -> bool {
+        data.len() >= crate::constants::NEW_SLAB_LEN
+    }
+
+    /// Read ExtParams reference from migrated slab data (zero-copy)
+    #[inline]
+    pub fn ext_params_ref(data: &[u8]) -> Result<&ExtParams, ProgramError> {
+        if data.len() < crate::constants::NEW_SLAB_LEN {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        let off = crate::constants::EXT_OFF;
+        let ptr = unsafe { data.as_ptr().add(off) };
+        // ExtParams is 16-byte aligned (u128 fields), ENGINE_OFF is 16-aligned, ENGINE_LEN is multiple of 16
+        if (ptr as usize) % 16 != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(unsafe { &*(ptr as *const ExtParams) })
+    }
+
+    /// Read mutable ExtParams reference from migrated slab data (zero-copy)
+    #[inline]
+    pub fn ext_params_mut(data: &mut [u8]) -> Result<&mut ExtParams, ProgramError> {
+        if data.len() < crate::constants::NEW_SLAB_LEN {
+            return Err(ProgramError::AccountDataTooSmall);
+        }
+        let off = crate::constants::EXT_OFF;
+        let ptr = unsafe { data.as_mut_ptr().add(off) };
+        if (ptr as usize) % 16 != 0 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(unsafe { &mut *(ptr as *mut ExtParams) })
+    }
+
     use solana_program::{
         account_info::AccountInfo, instruction::Instruction as SolInstruction,
         program::invoke_signed,
@@ -1184,6 +1267,15 @@ pub mod ix {
         AdminForceCloseAccount {
             user_idx: u16,
         },
+        /// Migrate slab to new layout: realloc to include ExtParams space.
+        /// Admin only. Slab grows by EXT_LEN bytes. ExtParams zero-initialized.
+        MigrateSlab,
+        /// Update ExtParams (max_pnl_vault_bps, max OI caps). Admin only.
+        UpdateExtParams {
+            max_pnl_vault_bps: u64,
+            max_long_oi: u128,
+            max_short_oi: u128,
+        },
     }
 
     impl Instruction {
@@ -1364,6 +1456,21 @@ pub mod ix {
                 21 => {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::AdminForceCloseAccount { user_idx })
+                }
+                22 => {
+                    // MigrateSlab
+                    Ok(Instruction::MigrateSlab)
+                }
+                23 => {
+                    // UpdateExtParams
+                    let max_pnl_vault_bps = read_u64(&mut rest)?;
+                    let max_long_oi = read_u128(&mut rest)?;
+                    let max_short_oi = read_u128(&mut rest)?;
+                    Ok(Instruction::UpdateExtParams {
+                        max_pnl_vault_bps,
+                        max_long_oi,
+                        max_short_oi,
+                    })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
@@ -2436,10 +2543,12 @@ pub mod processor {
         // Slab shape validation via verify helper (Kani-provable)
         // Accept old slabs that are 8 bytes smaller due to Account struct reordering migration.
         // Old slabs (1111384 bytes) work for up to 4095 accounts; new slabs (1111392) for 4096.
+        // Also accept migrated slabs (NEW_SLAB_LEN) with ExtParams appended.
+        use crate::constants::NEW_SLAB_LEN;
         const OLD_SLAB_LEN: usize = SLAB_LEN - 8;
         let shape = crate::verify::SlabShape {
             owned_by_program: slab.owner == program_id,
-            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN,
+            correct_len: data.len() == SLAB_LEN || data.len() == OLD_SLAB_LEN || data.len() == NEW_SLAB_LEN,
         };
         if !crate::verify::slab_shape_ok(shape) {
             // Return specific error based on which check failed
@@ -2557,6 +2666,38 @@ pub mod processor {
                 return Err(PercolatorError::InvalidTokenProgram.into());
             }
         }
+        Ok(())
+    }
+
+    /// Update OI counters and enforce OI caps after a trade.
+    /// old_pos/new_pos are the user's position before/after trade.
+    fn update_oi_and_check_caps(
+        ext: &mut zc::ExtParams,
+        old_pos: i128,
+        new_pos: i128,
+    ) -> Result<(), ProgramError> {
+        // Remove old position's contribution to OI
+        if old_pos > 0 {
+            ext.long_oi = ext.long_oi.saturating_sub(old_pos as u128);
+        } else if old_pos < 0 {
+            ext.short_oi = ext.short_oi.saturating_sub(old_pos.unsigned_abs());
+        }
+
+        // Add new position's contribution to OI
+        if new_pos > 0 {
+            ext.long_oi = ext.long_oi.saturating_add(new_pos as u128);
+        } else if new_pos < 0 {
+            ext.short_oi = ext.short_oi.saturating_add(new_pos.unsigned_abs());
+        }
+
+        // Enforce OI caps (0 = no cap)
+        if ext.max_long_oi > 0 && ext.long_oi > ext.max_long_oi {
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+        }
+        if ext.max_short_oi > 0 && ext.short_oi > ext.max_short_oi {
+            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+        }
+
         Ok(())
     }
 
@@ -3159,6 +3300,16 @@ pub mod processor {
                 };
                 state::write_config(&mut data, &config);
 
+                // Read max_pnl_vault_bps from ExtParams BEFORE engine borrow (avoids borrow conflict)
+                let max_pnl_vault_bps = if zc::is_migrated(&data) {
+                    match zc::ext_params_ref(&data) {
+                        Ok(ext) => ext.max_pnl_vault_bps,
+                        Err(_) => 0,
+                    }
+                } else {
+                    0
+                };
+
                 let engine = zc::engine_mut(&mut data)?;
 
                 // Crank authorization:
@@ -3204,6 +3355,7 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
                     sol_log_compute_units();
                 }
+
                 let _outcome = engine
                     .keeper_crank(
                         effective_caller_idx,
@@ -3211,6 +3363,7 @@ pub mod processor {
                         price,
                         effective_funding_rate,
                         allow_panic != 0,
+                        max_pnl_vault_bps,
                     )
                     .map_err(map_risk_error)?;
                 #[cfg(feature = "cu-audit")]
@@ -3364,6 +3517,9 @@ pub mod processor {
                     }
                 }
 
+                // Capture pre-trade user position for OI tracking
+                let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+
                 #[cfg(feature = "cu-audit")]
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_start");
@@ -3376,6 +3532,14 @@ pub mod processor {
                 {
                     msg!("CU_CHECKPOINT: trade_nocpi_execute_end");
                     sol_log_compute_units();
+                }
+
+                // OI tracking + cap enforcement (only on migrated slabs)
+                let new_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                // Drop engine borrow (NLL) before accessing ext_params
+                if zc::is_migrated(&data) {
+                    let ext = zc::ext_params_mut(&mut data)?;
+                    update_oi_and_check_caps(ext, old_user_pos, new_user_pos)?;
                 }
             }
             Instruction::TradeCpi {
@@ -3594,6 +3758,10 @@ pub mod processor {
 
                     // Trade size selection via verify helper (Kani-provable: uses exec_size, not requested_size)
                     let trade_size = crate::verify::cpi_trade_size(ret.exec_size, size);
+
+                    // Capture pre-trade user position for OI tracking
+                    let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+
                     #[cfg(feature = "cu-audit")]
                     {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_start");
@@ -3607,6 +3775,15 @@ pub mod processor {
                         msg!("CU_CHECKPOINT: trade_cpi_execute_end");
                         sol_log_compute_units();
                     }
+
+                    // OI tracking + cap enforcement (only on migrated slabs)
+                    let new_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                    // Drop engine borrow (NLL) before accessing ext_params
+                    if zc::is_migrated(&data) {
+                        let ext = zc::ext_params_mut(&mut data)?;
+                        update_oi_and_check_caps(ext, old_user_pos, new_user_pos)?;
+                    }
+
                     // Write nonce AFTER CPI and execute_trade to avoid ExternalAccountDataModified
                     state::write_req_nonce(&mut data, req_id);
 
@@ -4356,6 +4533,76 @@ pub mod processor {
                     base_to_pay,
                     &signer_seeds,
                 )?;
+            }
+            Instruction::MigrateSlab => {
+                // Tag 22: Realloc slab to include ExtParams space
+                // Accounts: [admin_signer, slab_writable, system_program]
+                accounts::expect_len(accounts, 3)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+                let _a_system = &accounts[2];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                // Read current slab data for admin check
+                {
+                    let data = a_slab.try_borrow_data()?;
+                    slab_guard(program_id, a_slab, &data)?;
+                    require_initialized(&data)?;
+                    let header = state::read_header(&data);
+                    require_admin(header.admin, a_admin.key)?;
+                    // Already migrated?
+                    if zc::is_migrated(&data) {
+                        return Err(ProgramError::AccountAlreadyInitialized);
+                    }
+                }
+
+                // Realloc the account to NEW_SLAB_LEN
+                let new_len = crate::constants::NEW_SLAB_LEN;
+                a_slab.realloc(new_len, true)?;
+
+                // Transfer rent difference from admin to slab
+                let rent = solana_program::rent::Rent::default();
+                let new_rent = rent.minimum_balance(new_len);
+                let current_lamports = a_slab.lamports();
+                if new_rent > current_lamports {
+                    let diff = new_rent - current_lamports;
+                    // Transfer lamports from admin to slab
+                    **a_admin.try_borrow_mut_lamports()? -= diff;
+                    **a_slab.try_borrow_mut_lamports()? += diff;
+                }
+
+                // ExtParams is zero-initialized by realloc(zero_init=true)
+                // No further initialization needed
+            }
+            Instruction::UpdateExtParams {
+                max_pnl_vault_bps,
+                max_long_oi,
+                max_short_oi,
+            } => {
+                // Tag 23: Update extended parameters. Admin only. Slab must be migrated.
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                if !zc::is_migrated(&data) {
+                    return Err(ProgramError::AccountDataTooSmall);
+                }
+
+                let ext = zc::ext_params_mut(&mut data)?;
+                ext.max_pnl_vault_bps = max_pnl_vault_bps;
+                ext.max_long_oi = max_long_oi;
+                ext.max_short_oi = max_short_oi;
             }
         }
         Ok(())
