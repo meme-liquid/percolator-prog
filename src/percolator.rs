@@ -3303,8 +3303,8 @@ pub mod processor {
                 };
                 state::write_config(&mut data, &config);
 
-                // Read max_pnl_vault_bps from ExtParams BEFORE engine borrow (avoids borrow conflict)
-                let max_pnl_vault_bps = if zc::is_migrated(&data) {
+                // Read max_pnl bps from ExtParams BEFORE engine borrow (avoids borrow conflict)
+                let max_pnl_bps = if zc::is_migrated(&data) {
                     match zc::ext_params_ref(&data) {
                         Ok(ext) => ext.max_pnl_vault_bps,
                         Err(_) => 0,
@@ -3314,6 +3314,22 @@ pub mod processor {
                 };
 
                 let engine = zc::engine_mut(&mut data)?;
+
+                // Compute absolute max PnL cap based on LP capital (not c_tot)
+                // LP capital = sum of capital for all LP accounts (typically 1-5 LPs, cheap)
+                let max_pnl_abs: u64 = if max_pnl_bps > 0 {
+                    let mut lp_capital_total: u128 = 0;
+                    for i in 0..MAX_ACCOUNTS {
+                        if engine.is_used(i) && engine.accounts[i].is_lp() {
+                            lp_capital_total = lp_capital_total.saturating_add(engine.accounts[i].capital.get());
+                        }
+                    }
+                    let abs_cap = lp_capital_total.saturating_mul(max_pnl_bps as u128) / 10_000;
+                    // Clamp to u64::MAX (engine parameter is u64)
+                    core::cmp::min(abs_cap, u64::MAX as u128) as u64
+                } else {
+                    0
+                };
 
                 // Crank authorization:
                 // - Permissionless mode (caller_idx == u16::MAX): anyone can crank
@@ -3372,7 +3388,7 @@ pub mod processor {
                         price,
                         effective_funding_rate,
                         allow_panic != 0,
-                        max_pnl_vault_bps,
+                        max_pnl_abs,
                         max_oi_abs,
                     )
                     .map_err(map_risk_error)?;
