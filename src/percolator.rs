@@ -1272,6 +1272,11 @@ pub mod ix {
         },
         /// Unresolve market: clear RESOLVED flag so trading can resume. Admin only.
         UnresolveMarket,
+        /// Update margin parameters (initial_margin_bps, maintenance_margin_bps). Admin only.
+        UpdateMarginParams {
+            initial_margin_bps: u64,
+            maintenance_margin_bps: u64,
+        },
     }
 
     impl Instruction {
@@ -1469,6 +1474,14 @@ pub mod ix {
                     })
                 }
                 24 => Ok(Instruction::UnresolveMarket),
+                25 => {
+                    let initial_margin_bps = read_u64(&mut rest)?;
+                    let maintenance_margin_bps = read_u64(&mut rest)?;
+                    Ok(Instruction::UpdateMarginParams {
+                        initial_margin_bps,
+                        maintenance_margin_bps,
+                    })
+                }
                 _ => Err(ProgramError::InvalidInstructionData),
             }
         }
@@ -4640,6 +4653,28 @@ pub mod processor {
                 }
 
                 state::clear_resolved(&mut data);
+            }
+            Instruction::UpdateMarginParams {
+                initial_margin_bps,
+                maintenance_margin_bps,
+            } => {
+                // Tag 25: Update margin parameters. Admin only.
+                accounts::expect_len(accounts, 2)?;
+                let a_admin = &accounts[0];
+                let a_slab = &accounts[1];
+
+                accounts::expect_signer(a_admin)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let header = state::read_header(&data);
+                require_admin(header.admin, a_admin.key)?;
+
+                let engine = zc::engine_mut(&mut data)?;
+                engine.params.initial_margin_bps = initial_margin_bps;
+                engine.params.maintenance_margin_bps = maintenance_margin_bps;
             }
         }
         Ok(())
