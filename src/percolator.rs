@@ -3338,7 +3338,9 @@ pub mod processor {
                         }
                     }
                     let abs_cap = lp_capital_total.saturating_mul(max_pnl_bps as u128) / 10_000;
-                    // Clamp to u64::MAX (engine parameter is u64)
+                    // Floor: if LP capital is near zero, use 1 lamport as minimum cap
+                    // This prevents cap=0 which would disable max PnL protection entirely
+                    let abs_cap = abs_cap.max(1);
                     core::cmp::min(abs_cap, u64::MAX as u128) as u64
                 } else {
                     0
