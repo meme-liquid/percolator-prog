@@ -3520,6 +3520,14 @@ pub mod processor {
                     oracle::read_price_clamped(&mut config, a_oracle, clock.unix_timestamp)?;
                 state::write_config(&mut data, &config);
 
+                // Read max PnL bps BEFORE engine borrow (avoids borrow conflict)
+                let trade_max_pnl_bps: u64 = if zc::is_migrated(&data) {
+                    match zc::ext_params_ref(&data) {
+                        Ok(ext) => ext.max_pnl_vault_bps,
+                        Err(_) => 0,
+                    }
+                } else { 0 };
+
                 let engine = zc::engine_mut(&mut data)?;
 
                 check_idx(engine, lp_idx)?;
@@ -3574,7 +3582,17 @@ pub mod processor {
                     sol_log_compute_units();
                 }
 
-                // NOTE: OI tracking temporarily disabled — max_pnl protection still active via crank
+                // Trade-time PnL cap: reject trade if user profit exceeds LP-based cap
+                if trade_max_pnl_bps > 0 {
+                    let user_pnl = engine.accounts[user_idx as usize].pnl.get();
+                    if user_pnl > 0 {
+                        let lp_cap = engine.accounts[lp_idx as usize].capital.get();
+                        let max_pnl = (lp_cap.saturating_mul(trade_max_pnl_bps as u128) / 10_000).max(1);
+                        if (user_pnl as u128) > max_pnl {
+                            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+                        }
+                    }
+                }
             }
             Instruction::TradeCpi {
                 lp_idx,
@@ -3763,6 +3781,13 @@ pub mod processor {
                 };
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
+                    // Read max PnL bps BEFORE engine borrow
+                    let trade_max_pnl_bps: u64 = if zc::is_migrated(&data) {
+                        match zc::ext_params_ref(&data) {
+                            Ok(ext) => ext.max_pnl_vault_bps,
+                            Err(_) => 0,
+                        }
+                    } else { 0 };
                     state::write_config(&mut data, &config);
                     let engine = zc::engine_mut(&mut data)?;
 
@@ -3807,7 +3832,17 @@ pub mod processor {
                         sol_log_compute_units();
                     }
 
-                    // NOTE: OI tracking temporarily disabled — max_pnl protection still active via crank
+                    // Trade-time PnL cap: reject trade if user profit exceeds LP-based cap
+                    if trade_max_pnl_bps > 0 {
+                        let user_pnl = engine.accounts[user_idx as usize].pnl.get();
+                        if user_pnl > 0 {
+                            let lp_cap = engine.accounts[lp_idx as usize].capital.get();
+                            let max_pnl = (lp_cap.saturating_mul(trade_max_pnl_bps as u128) / 10_000).max(1);
+                            if (user_pnl as u128) > max_pnl {
+                                return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+                            }
+                        }
+                    }
 
                     // Write nonce AFTER CPI and execute_trade to avoid ExternalAccountDataModified
                     state::write_req_nonce(&mut data, req_id);
