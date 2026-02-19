@@ -177,6 +177,47 @@ fn compute_net_lp_pos(engine: &percolator::RiskEngine) -> i128 {
     engine.net_lp_pos.get()
 }
 
+/// Default OI utilization cap relative to LP capital notional (10000 = 1.0x).
+const DEFAULT_MAX_OI_UTIL_BPS: u64 = 10_000;
+
+/// Compute LP-capital-based OI cap in position units (same unit as position_size).
+///
+/// Formula:
+///   max_oi_abs = (lp_capital_total * 1e6 / oracle_price) * util_bps / 10000
+#[inline]
+fn compute_dynamic_max_oi_abs(engine: &percolator::RiskEngine, oracle_price_e6: u64) -> u128 {
+    if oracle_price_e6 == 0 {
+        return 0;
+    }
+
+    let mut lp_capital_total: u128 = 0;
+    for i in 0..percolator::MAX_ACCOUNTS {
+        if engine.is_used(i) && engine.accounts[i].is_lp() {
+            lp_capital_total = lp_capital_total.saturating_add(engine.accounts[i].capital.get());
+        }
+    }
+
+    if lp_capital_total == 0 {
+        return 0;
+    }
+
+    let max_oi_abs = lp_capital_total
+        .saturating_mul(1_000_000)
+        .saturating_div(oracle_price_e6 as u128)
+        .saturating_mul(DEFAULT_MAX_OI_UTIL_BPS as u128)
+        / 10_000;
+
+    max_oi_abs.max(1)
+}
+
+#[inline]
+fn abs_pos_increases(old_pos: i128, delta: i128) -> bool {
+    let Some(new_pos) = old_pos.checked_add(delta) else {
+        return true;
+    };
+    new_pos.unsigned_abs() > old_pos.unsigned_abs()
+}
+
 /// Compute inventory-based funding rate (bps per slot).
 ///
 /// Engine convention:
@@ -3390,11 +3431,9 @@ pub mod processor {
                     sol_log_compute_units();
                 }
 
-                // Compute dynamic OI cap: 10x current total OI (same units as position_size)
-                // Engine uses this to gate new position opens when OI is excessive
-                let max_oi_abs = engine.total_open_interest.get()
-                    .saturating_mul(10)
-                    .max(100_000_000_000); // Minimum floor: 100B position-units
+                // Compute dynamic OI cap from LP capital (in position units).
+                // This is a hard capacity cap instead of a self-referential `current_oi * k`.
+                let max_oi_abs = crate::compute_dynamic_max_oi_abs(engine, price);
 
                 let _outcome = engine
                     .keeper_crank(
@@ -3564,6 +3603,17 @@ pub mod processor {
                     }
                     let old_lp_pos = engine.accounts[lp_idx as usize].position_size.get();
                     if risk_state.would_increase_risk(old_lp_pos, -size) {
+                        return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+                    }
+                }
+
+                // OI cap gate: block risk-increasing trades when OI is at/over dynamic cap.
+                let max_oi_abs = crate::compute_dynamic_max_oi_abs(engine, price);
+                if max_oi_abs > 0 {
+                    let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                    if crate::abs_pos_increases(old_user_pos, size)
+                        && engine.total_open_interest.get() >= max_oi_abs
+                    {
                         return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                     }
                 }
@@ -3811,6 +3861,17 @@ pub mod processor {
                         }
                         let old_lp_pos = engine.accounts[lp_idx as usize].position_size.get();
                         if risk_state.would_increase_risk(old_lp_pos, -ret.exec_size) {
+                            return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
+                        }
+                    }
+
+                    // OI cap gate: block risk-increasing trades when OI is at/over dynamic cap.
+                    let max_oi_abs = crate::compute_dynamic_max_oi_abs(engine, price);
+                    if max_oi_abs > 0 {
+                        let old_user_pos = engine.accounts[user_idx as usize].position_size.get();
+                        if crate::abs_pos_increases(old_user_pos, ret.exec_size)
+                            && engine.total_open_interest.get() >= max_oi_abs
+                        {
                             return Err(PercolatorError::EngineRiskReductionOnlyMode.into());
                         }
                     }
