@@ -13919,6 +13919,64 @@ fn test_issue65_deferred_phase2_candidate_cascade_keeps_making_progress() {
 }
 
 #[test]
+fn test_issue81_candidate_padding_cannot_shield_tail_loss_into_insurance() {
+    program_path();
+
+    let (mut env, _lp, _lp_idx, actors) = setup_max_risk_probe(17, 0);
+    assert!(
+        actors.len() > percolator_prog::constants::MAX_KEEPER_CANDIDATES,
+        "setup must leave a losing account outside the supplied candidate cap"
+    );
+
+    let candidates: Vec<u16> = actors
+        .iter()
+        .take(percolator_prog::constants::MAX_KEEPER_CANDIDATES)
+        .map(|a| a.idx)
+        .collect();
+    let tail = actors
+        .iter()
+        .skip(percolator_prog::constants::MAX_KEEPER_CANDIDATES)
+        .find(|a| env.read_account_position(a.idx) != 0)
+        .expect("setup must have a non-candidate exposed account")
+        .idx;
+
+    let insurance_start = env.read_insurance_balance();
+    let mut min_insurance = insurance_start;
+    let mut price = MAX_RISK_P0_E6;
+
+    for round in 0..6 {
+        let slot = env.read_last_market_slot().saturating_add(10);
+        price = max_risk_next_clamped_price(price, -1, 10);
+        env.set_slot_and_price_raw_no_walk(slot, price as i64);
+
+        let before_rr = env.read_rr_cursor_position();
+        let before_tail_pos = env.read_account_position(tail);
+        let before_tail_cap = env.read_account_capital(tail);
+        let crank = try_crank_with_candidate_indices(&mut env, &candidates);
+        assert!(
+            crank.is_ok(),
+            "candidate-bearing crank must keep bounded progress on round {round}: {crank:?}"
+        );
+        let after_rr = env.read_rr_cursor_position();
+        let after_tail_pos = env.read_account_position(tail);
+        let after_tail_cap = env.read_account_capital(tail);
+        min_insurance = min_insurance.min(env.read_insurance_balance());
+
+        assert!(
+            after_rr != before_rr
+                || after_tail_pos != before_tail_pos
+                || after_tail_cap != before_tail_cap
+                || env.read_last_market_slot() >= slot,
+            "candidate-bearing crank made no observable progress on round {round}: rr={before_rr}->{after_rr}, tail_pos={before_tail_pos}->{after_tail_pos}, tail_cap={before_tail_cap}->{after_tail_cap}"
+        );
+        assert!(
+            min_insurance >= insurance_start,
+            "candidate padding must not shield an uncovered tail account until it bankrupts insurance: start={insurance_start}, min={min_insurance}, round={round}, tail={tail}, rr={before_rr}->{after_rr}, tail_pos={before_tail_pos}->{after_tail_pos}, tail_cap={before_tail_cap}->{after_tail_cap}"
+        );
+    }
+}
+
+#[test]
 fn test_issue65_candidate_cap_dense_cascade_has_progress_path() {
     program_path();
 

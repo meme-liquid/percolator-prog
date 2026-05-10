@@ -68,22 +68,24 @@ pub mod constants {
     pub const MAX_KEEPER_CANDIDATES: usize = 8;
     /// Phase 1 revalidation/liquidation execution budget per KeeperCrank
     /// (wrapper-owned since v12.19, which dropped the engine-level
-    /// `LIQ_BUDGET_PER_CRANK`). Kept at 8 so dense liquidation cascades plus
-    /// wrapper coverage checks fit the SVM compute envelope.
-    pub const LIQ_BUDGET_PER_CRANK: u16 = 8;
+    /// `LIQ_BUDGET_PER_CRANK`). Sized to cover the wrapper-owned structural
+    /// cursor window so candidate padding cannot make Phase 2 touch accounts
+    /// that Phase 1 had no budget to close.
+    pub const LIQ_BUDGET_PER_CRANK: u16 = 32;
     /// Maximum candidate entries the wrapper/engine may inspect before Phase 2.
     /// This is deliberately independent from the liquidation execution budget:
     /// malformed or non-actionable candidate padding still consumes bounded
     /// inspection work, while honest keepers can over-specify a small tail.
-    pub const CANDIDATE_INSPECTION_BUDGET_PER_CRANK: u16 = 8;
+    pub const CANDIDATE_INSPECTION_BUDGET_PER_CRANK: u16 = 32;
     /// Phase 2 mandatory engine round-robin touch window. Kept at 32 so dense
     /// no-candidate cranks remain below the SVM CU cap after the engine's
     /// liquidation pass and wrapper risk-buffer maintenance.
     pub const RR_WINDOW_PER_CRANK: u64 = 32;
-    /// Candidate-bearing cranks have extra wrapper coverage checks and engine
-    /// liquidation work. Keep their structural RR window small; empty cranks
-    /// own the wider cursor walk.
-    pub const RR_WINDOW_WITH_CANDIDATES_PER_CRANK: u64 = 4;
+    /// Candidate-bearing cranks must retain the same structural Phase-2
+    /// coverage as empty cranks. Caller-supplied candidates are liquidation
+    /// hints; they must not narrow the cursor walk enough for a candidate
+    /// prefix to shield later exposed accounts across multiple price steps.
+    pub const RR_WINDOW_WITH_CANDIDATES_PER_CRANK: u64 = RR_WINDOW_PER_CRANK;
     /// Engine Phase 2 inspected-slot cap. This is intentionally explicit even
     /// when the deployment wants full-slab greedy progress: avoid delegating
     /// unbounded `u64::MAX` scan policy to the engine API.
@@ -4927,6 +4929,71 @@ pub mod processor {
         )
     }
 
+    fn candidate_list_contains(
+        candidates: &[(u16, Option<percolator::LiquidationPolicy>)],
+        idx: u16,
+    ) -> bool {
+        candidates
+            .iter()
+            .any(|&(candidate_idx, _)| candidate_idx == idx)
+    }
+
+    /// Promote the upcoming Phase-2 structural window into the engine's Phase-1
+    /// candidate stream. Phase 2 is intentionally touch-only; without this
+    /// promotion, a caller-supplied candidate prefix can make the cursor settle
+    /// a later losing account without giving the engine a same-crank
+    /// liquidation opportunity. Caller candidates remain untrusted hints: they
+    /// are skipped here so padding cannot consume this structural budget twice.
+    fn append_phase2_fullclose_candidates(
+        engine: &RiskEngine,
+        combined: &mut alloc::vec::Vec<(u16, Option<percolator::LiquidationPolicy>)>,
+        caller_candidates: &[(u16, Option<percolator::LiquidationPolicy>)],
+        rr_touch_limit: u64,
+        rr_scan_limit: u64,
+        combined_cap: usize,
+    ) -> Result<(), ProgramError> {
+        if rr_touch_limit == 0 || rr_scan_limit == 0 || combined.len() >= combined_cap {
+            return Ok(());
+        }
+        let wrap_bound =
+            core::cmp::min(engine.params.max_accounts, percolator::MAX_ACCOUNTS as u64);
+        if wrap_bound == 0 || engine.rr_cursor_position >= wrap_bound {
+            return Err(PercolatorError::EngineCorruptState.into());
+        }
+
+        let scan_cap = core::cmp::min(rr_scan_limit, wrap_bound);
+        let mut i = engine.rr_cursor_position;
+        let mut inspected = 0u64;
+        let mut touched = 0u64;
+        while inspected < scan_cap && touched < rr_touch_limit && combined.len() < combined_cap {
+            let idx = i as usize;
+            if idx_used_in_market(engine, idx) {
+                touched = touched
+                    .checked_add(1)
+                    .ok_or(PercolatorError::EngineOverflow)?;
+                let idx_u16: u16 = idx
+                    .try_into()
+                    .map_err(|_| PercolatorError::EngineOverflow)?;
+                if !candidate_list_contains(caller_candidates, idx_u16)
+                    && !candidate_list_contains(combined, idx_u16)
+                    && effective_pos_q_checked(engine, idx)? != 0
+                {
+                    combined.push((idx_u16, Some(percolator::LiquidationPolicy::FullClose)));
+                }
+            }
+
+            i = i.checked_add(1).ok_or(PercolatorError::EngineOverflow)?;
+            inspected = inspected
+                .checked_add(1)
+                .ok_or(PercolatorError::EngineOverflow)?;
+            if i == wrap_bound {
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
     fn sync_keeper_candidate_fees_after_crank(
         engine: &mut RiskEngine,
         combined: &[(u16, Option<percolator::LiquidationPolicy>)],
@@ -6922,8 +6989,10 @@ pub mod processor {
                     msg!("CU_CHECKPOINT: keeper_crank_start");
                     sol_log_compute_units();
                 }
-                let mut combined =
-                    alloc::vec::Vec::with_capacity(buf.count as usize + candidates.len());
+                const COMBINED_CAP: usize = crate::constants::RISK_BUF_CAP
+                    + crate::constants::MAX_KEEPER_CANDIDATES
+                    + crate::constants::RR_WINDOW_WITH_CANDIDATES_PER_CRANK as usize;
+                let mut combined = alloc::vec::Vec::with_capacity(COMBINED_CAP);
                 for i in 0..buf.count as usize {
                     let risk_idx = buf.entries[i].idx;
                     let risk_eff_abs = if idx_used_in_market(engine, risk_idx as usize) {
@@ -6949,31 +7018,6 @@ pub mod processor {
                         break;
                     }
                     combined.push((risk_idx, Some(percolator::LiquidationPolicy::FullClose)));
-                }
-                for &(cidx, policy) in candidates.iter() {
-                    let mut already_promoted = false;
-                    if matches!(policy, Some(percolator::LiquidationPolicy::ExactPartial(_))) {
-                        for i in 0..buf.count as usize {
-                            if buf.entries[i].idx == cidx {
-                                already_promoted = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !already_promoted {
-                        combined.push((cidx, policy));
-                    }
-                }
-                // Defense-in-depth cap: the decode-time check already
-                // bounds candidates, but truncating `combined` here as
-                // well ensures the engine's scan is bounded even if the
-                // decode cap is loosened in the future or an insider
-                // path ever constructs `combined` differently. Cap:
-                // risk buffer max + the decoded candidate cap.
-                const COMBINED_CAP: usize =
-                    crate::constants::RISK_BUF_CAP + crate::constants::MAX_KEEPER_CANDIDATES;
-                if combined.len() > COMBINED_CAP {
-                    combined.truncate(COMBINED_CAP);
                 }
 
                 // ── Periodic maintenance fees (wrapper-owned, §8.3) ──
@@ -7024,7 +7068,8 @@ pub mod processor {
                 };
                 let partial_target =
                     oversized_catchup_target(engine, clock.slot, raw_target, funding_rate_e9_pre)?;
-                let has_liquidation_hint = combined.iter().any(|&(_, policy)| policy.is_some());
+                let has_liquidation_hint = combined.iter().any(|&(_, policy)| policy.is_some())
+                    || candidates.iter().any(|&(_, policy)| policy.is_some());
                 let (crank_slot, crank_price, partial_catchup, rr_window_size, rr_scan_limit) =
                     if let Some(segment_slot) = partial_target {
                         let segment_dt = segment_slot.saturating_sub(engine.last_market_slot);
@@ -7084,6 +7129,43 @@ pub mod processor {
                 let admit_h_min = engine.params.h_min;
                 let admit_h_max = engine.params.h_max;
                 let admit_threshold = Some(engine.params.maintenance_margin_bps as u128);
+                if !candidates.is_empty() {
+                    append_phase2_fullclose_candidates(
+                        engine,
+                        &mut combined,
+                        &candidates,
+                        rr_window_size,
+                        rr_scan_limit,
+                        COMBINED_CAP,
+                    )?;
+                }
+                for &(cidx, policy) in candidates.iter() {
+                    let mut already_promoted = candidate_list_contains(&combined, cidx);
+                    if !already_promoted
+                        && matches!(policy, Some(percolator::LiquidationPolicy::ExactPartial(_)))
+                    {
+                        for i in 0..buf.count as usize {
+                            if buf.entries[i].idx == cidx {
+                                already_promoted = true;
+                                break;
+                            }
+                        }
+                    }
+                    if !already_promoted {
+                        combined.push((cidx, policy));
+                    }
+                    if combined.len() == COMBINED_CAP {
+                        break;
+                    }
+                }
+                // Defense-in-depth cap: the decode-time check already bounds
+                // candidates, but truncating `combined` here as well ensures
+                // the engine's scan is bounded even if the decode cap is
+                // loosened in the future or an insider path constructs
+                // `combined` differently.
+                if combined.len() > COMBINED_CAP {
+                    combined.truncate(COMBINED_CAP);
+                }
                 let bounded_engine_candidates = combined
                     .iter()
                     .map(|&(idx, policy)| (idx, policy))

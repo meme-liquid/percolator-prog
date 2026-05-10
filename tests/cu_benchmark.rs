@@ -1377,7 +1377,8 @@ fn benchmark_keeper_crank_dense_candidate_cap_fixed_size_and_progress() {
             "dense candidate-cap sequence should make durable progress"
         );
         println!("  actors={num_actors:>3}: worst_cu={worst_cu:>8}, total_closed={total_closed}");
-        if num_actors == percolator_prog::constants::MAX_KEEPER_CANDIDATES {
+        let structural_saturation = 128usize;
+        if saturated_reference.is_none() && num_actors >= structural_saturation {
             saturated_reference = Some(worst_cu);
         }
         results.push((num_actors, worst_cu));
@@ -1385,12 +1386,12 @@ fn benchmark_keeper_crank_dense_candidate_cap_fixed_size_and_progress() {
 
     let reference = saturated_reference.expect("test sizes must include candidate cap");
     for (num_actors, worst_cu) in results {
-        if num_actors <= percolator_prog::constants::MAX_KEEPER_CANDIDATES {
+        if num_actors < 128 {
             continue;
         }
         assert!(
             worst_cu <= reference + 250_000,
-            "keeper CU should remain budget-shaped once candidate cap is saturated: cap_cu={reference}, actors={num_actors}, worst_cu={worst_cu}"
+            "keeper CU should remain budget-shaped once the structural candidate+phase2 window is saturated: saturated_cu={reference}, actors={num_actors}, worst_cu={worst_cu}"
         );
     }
 }
