@@ -6800,6 +6800,15 @@ fn two_sided_fee_for_trade(size_q: i128, exec_price_e6: u64, fee_bps: u64) -> u1
     ((notional * fee_bps as u128 + 9_999) / 10_000) * 2
 }
 
+fn controlled_extractable_upper_bound(env: &TradeCpiTestEnv, indices: &[u16]) -> u128 {
+    indices.iter().fold(0u128, |acc, &idx| {
+        let capital = env.read_account_capital(idx);
+        let pnl = env.read_account_pnl(idx);
+        acc.saturating_add(capital)
+            .saturating_add(if pnl > 0 { pnl as u128 } else { 0 })
+    })
+}
+
 #[test]
 fn test_hyperp_after_hours_trade_fee_matches_ewma_mark_movement() {
     let mut env = TradeCpiTestEnv::new();
@@ -6850,6 +6859,67 @@ fn test_hyperp_after_hours_trade_fee_matches_ewma_mark_movement() {
         insurance_after - insurance_before,
         expected_fee,
         "wrapper fee should be base fee + actual EWMA mark movement"
+    );
+}
+
+#[test]
+fn test_hyperp_after_hours_self_deal_mark_move_cannot_create_extractable_claim() {
+    let mut env = TradeCpiTestEnv::new();
+    init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let controlled = [lp_idx, user_idx];
+    let claim_before = controlled_extractable_upper_bound(&env, &controlled);
+    let insurance_before = env.read_insurance_balance();
+    let cfg_before = read_market_config(&env);
+
+    // Self-deal through a controlled LP in after-hours Hyperp mode. The trade
+    // moves the fee-weighted mark, then the next crank settles the resulting
+    // mark movement across both controlled accounts. A disposable losing side
+    // must not let the winning side create an extractable claim larger than
+    // the attacker's pre-trade controlled claim, and insurance must not be
+    // depleted by the mark-walk.
+    env.set_slot(101);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("after-hours self-deal should execute with dynamic fee");
+    let cfg_after_trade = read_market_config(&env);
+    assert!(
+        cfg_after_trade.mark_ewma_e6 != cfg_before.mark_ewma_e6,
+        "test setup must move the EWMA mark"
+    );
+    assert!(
+        env.read_insurance_balance() > insurance_before,
+        "dynamic mark-movement fee must be collected into insurance"
+    );
+
+    env.set_slot(102);
+    env.crank();
+
+    let claim_after = controlled_extractable_upper_bound(&env, &controlled);
+    let insurance_after = env.read_insurance_balance();
+    assert!(
+        claim_after <= claim_before,
+        "self-dealt after-hours mark move created extractable attacker claim: before={claim_before}, after={claim_after}"
+    );
+    assert!(
+        insurance_after >= insurance_before,
+        "self-dealt after-hours mark move drained insurance: before={insurance_before}, after={insurance_after}"
     );
 }
 
