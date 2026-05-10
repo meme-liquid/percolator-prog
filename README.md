@@ -564,8 +564,13 @@ Recovery is "by design impossible" (this is a one-way governance lock).
 ## Build & test
 
 ```bash
-# Build BPF binary (required before running CU benchmark)
-cargo build-sbf
+# Build BPF binary (required before running CU benchmark).
+# The default build uses the Anchor v2/Pinocchio entrypoint; Anchor v2's
+# current dependency stack needs platform-tools v1.52 or newer.
+cargo build-sbf --tools-version v1.52
+
+# Legacy solana_program entrypoint, kept for comparison/debugging.
+cargo build-sbf --no-default-features
 
 # All tests (integration, unit, alignment)
 cargo test
