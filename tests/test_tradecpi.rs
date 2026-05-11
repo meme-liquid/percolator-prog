@@ -6612,18 +6612,17 @@ fn test_slot_reuse_does_not_reuse_lp_matcher_identity() {
     assert_ne!(lp1_idx, lp2_idx, "LPs must be at different slots");
 }
 
-/// Audit #1 regression: honest same-price Hyperp trades MUST refresh
-/// the mark-liveness timer, otherwise a fully admin-free Hyperp market
-/// with steady-price real trading would expire into
-/// ResolvePermissionless.
+/// Audit #1 regression: honest Hyperp trades that move the trade-derived
+/// mark MUST refresh the mark-liveness timer, otherwise a fully admin-free
+/// Hyperp market with real trading can expire into ResolvePermissionless.
 ///
-/// Under the prior rule, liveness refreshed only when
-/// `config.mark_ewma_e6 != old_ewma_cpi` — same-price trades with a
-/// flat EWMA didn't count. The fix checks observation eligibility
-/// (fee_paid >= mark_min_fee) instead, so honest full-fee same-price
-/// trades DO refresh the liveness slots.
+/// The default passive matcher quotes with a spread, so this is a
+/// mark-moving trade. A separate after-hours regression below covers the
+/// opposite case: a zero-spread same-price wash trade must NOT refresh
+/// liveness, because that would let a controlled matcher pin future EWMA
+/// alpha for only the base fee.
 #[test]
-fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
+fn test_hyperp_mark_moving_trades_refresh_liveness_and_market_stays_live() {
     let mut env = TradeCpiTestEnv::new();
     env.init_market_hyperp(1_000_000);
 
@@ -6655,11 +6654,10 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
     env.set_slot(100);
     let (ewma_before, push_before) = read_slots(&env);
 
-    // Execute a same-price TradeCpi fill at a later slot. Under the
-    // old rule (EWMA-value-change refresh), same-price trades with a
-    // flat EWMA wouldn't move the liveness slots. Under the fix, an
-    // observation-eligible fill (mark_min_fee == 0 here) refreshes
-    // both mark_ewma_last_slot and last_mark_push_slot.
+    // Execute a mark-moving TradeCpi fill at a later slot. The observation-
+    // eligible fill (mark_min_fee == 0 here) refreshes both
+    // mark_ewma_last_slot and last_mark_push_slot because it actually moves
+    // the EWMA mark.
     env.set_slot(500);
     env.try_trade_cpi(
         &user,
@@ -6677,14 +6675,14 @@ fn test_hyperp_same_price_trades_refresh_liveness_and_market_stays_live() {
     assert!(
         ewma_after > ewma_before,
         "mark_ewma_last_slot must advance on observation-eligible \
-         same-price trade (audit #1). before={} after={}",
+         mark-moving trade (audit #1). before={} after={}",
         ewma_before,
         ewma_after,
     );
     assert!(
         push_after > push_before,
         "last_mark_push_slot must advance on observation-eligible \
-         same-price Hyperp trade (audit #1). before={} after={}",
+         mark-moving Hyperp trade (audit #1). before={} after={}",
         push_before,
         push_after,
     );
@@ -7145,6 +7143,59 @@ fn test_hyperp_after_hours_mark_stays_static_until_trade_then_fee_rises() {
     assert_eq!(
         actual_fee, expected_fee,
         "dynamic after-hours fee should be base fee plus actual EWMA mark movement"
+    );
+}
+
+#[test]
+fn test_hyperp_after_hours_same_price_wash_trade_cannot_pin_liveness_clock() {
+    let mut env = TradeCpiTestEnv::new();
+    init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) =
+        init_lp_with_passive_matcher_params(&mut env, &lp, &matcher_prog, 0, 0, 0, 20_000_000_000);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let cfg_before = read_market_config(&env);
+    let insurance_before = env.read_insurance_balance();
+
+    env.set_slot(101);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("same-price after-hours wash trade should execute at base fee");
+
+    let cfg_after = read_market_config(&env);
+    assert_eq!(
+        cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
+        "zero-spread same-price wash trade must not move the EWMA mark"
+    );
+    assert_eq!(
+        cfg_after.hyperp_mark_e6, cfg_before.hyperp_mark_e6,
+        "zero-spread same-price wash trade must not move the Hyperp mark"
+    );
+    assert_eq!(
+        cfg_after.mark_ewma_last_slot, cfg_before.mark_ewma_last_slot,
+        "same-price wash trades must not reset the EWMA clock and pin future alpha"
+    );
+    assert_eq!(
+        cfg_after.last_mark_push_slot, cfg_before.last_mark_push_slot,
+        "same-price wash trades must not refresh Hyperp liveness"
+    );
+    assert!(
+        env.read_insurance_balance() > insurance_before,
+        "the trade still pays the ordinary base fee; it just cannot buy a liveness refresh without a mark movement"
     );
 }
 

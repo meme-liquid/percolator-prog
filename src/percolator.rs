@@ -8354,6 +8354,7 @@ pub mod processor {
                     // liveness refresh (after the block) can check
                     // whether the mark actually moved.
                     let old_ewma_cpi = config.mark_ewma_e6;
+                    let mut trade_mark_moved_cpi = false;
                     // Update trade-derived mark EWMA (all market types).
                     // Per-slot price-move cap is init-immutable (engine RiskParams).
                     let max_change_bps_cpi = engine.params.max_price_move_bps_per_slot;
@@ -8389,21 +8390,17 @@ pub mod processor {
                             fee_paid_cpi,
                             config.mark_min_fee,
                         );
-                        // Only full-weight observations advance the EWMA
-                        // clock (Finding 7). Partial-alpha nudges from
-                        // sub-threshold trades still mutate the EWMA
-                        // value, but the clock is treated strictly as a
-                        // liveness signal — otherwise dust trades on
-                        // Hyperp markets refresh the soft-staleness check
-                        // `max(mark_ewma_last_slot, last_mark_push_slot)`,
-                        // keeping an otherwise-dead market alive. The
-                        // minor EWMA-dt drift (next full-weight trade
-                        // sees `dt = time_since_last_full_weight`, not
-                        // `time_since_last_partial`) is an acceptable
-                        // tradeoff.
+                        trade_mark_moved_cpi = config.mark_ewma_e6 != old_ewma_cpi;
+                        // Only full-weight observations that actually move
+                        // the EWMA advance its clock. Sub-threshold fills
+                        // and same-price wash trades can mutate/pay as
+                        // configured, but they do not reset the EWMA clock:
+                        // otherwise a controlled matcher can pin future
+                        // alpha by repeatedly trading at the old mark for
+                        // only the base fee.
                         let full_weight_observation =
                             config.mark_min_fee == 0 || fee_paid_cpi >= config.mark_min_fee;
-                        if full_weight_observation {
+                        if full_weight_observation && trade_mark_moved_cpi {
                             config.mark_ewma_last_slot = clock.slot;
                         }
                         // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
@@ -8428,7 +8425,10 @@ pub mod processor {
                         );
                         // Full-weight observation check: recompute here
                         // because the earlier `full_weight_observation`
-                        // binding is in the cap>0 branch's scope.
+                        // binding is in the cap>0 branch's scope. Hyperp
+                        // liveness also requires actual EWMA movement, so
+                        // same-price wash trades cannot keep a pinned mark
+                        // live indefinitely.
                         let fee_paid_hyperp = if config.mark_min_fee > 0 {
                             let ins_after_cpi = engine.insurance_fund.balance.get();
                             let delta = ins_after_cpi
@@ -8440,7 +8440,7 @@ pub mod processor {
                         };
                         let full_weight =
                             config.mark_min_fee == 0 || fee_paid_hyperp >= config.mark_min_fee;
-                        if full_weight {
+                        if full_weight && trade_mark_moved_cpi {
                             config.last_mark_push_slot = clock.slot as u128;
                         }
                     }
@@ -10385,9 +10385,7 @@ pub mod entrypoint {
             LegacyProgramError::UninitializedAccount => AnchorProgramError::UninitializedAccount,
             LegacyProgramError::NotEnoughAccountKeys => AnchorProgramError::NotEnoughAccountKeys,
             LegacyProgramError::AccountBorrowFailed => AnchorProgramError::AccountBorrowFailed,
-            LegacyProgramError::MaxSeedLengthExceeded => {
-                AnchorProgramError::MaxSeedLengthExceeded
-            }
+            LegacyProgramError::MaxSeedLengthExceeded => AnchorProgramError::MaxSeedLengthExceeded,
             LegacyProgramError::InvalidSeeds => AnchorProgramError::InvalidSeeds,
             LegacyProgramError::BorshIoError(_) => AnchorProgramError::BorshIoError,
             LegacyProgramError::AccountNotRentExempt => AnchorProgramError::AccountNotRentExempt,
