@@ -1009,15 +1009,6 @@ fn test_withdraw_insurance_decrements_engine_vault() {
     println!("WITHDRAW INSURANCE DECREMENTS ENGINE VAULT: PASSED");
 }
 
-/// Cooldown enforcement on WithdrawInsuranceLimited (resolved market).
-#[test]
-
-/// BPS cap enforcement on WithdrawInsuranceLimited.
-#[test]
-
-/// insurance_withdraw_max_bps == 0 blocks live-market withdrawals.
-#[test]
-
 /// InitMarket must reject insurance_withdraw_max_bps > 10000.
 #[test]
 fn test_init_market_insurance_withdraw_max_bps_bounded() {

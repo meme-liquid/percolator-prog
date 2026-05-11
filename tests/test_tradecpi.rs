@@ -6809,6 +6809,89 @@ fn controlled_extractable_upper_bound(env: &TradeCpiTestEnv, indices: &[u16]) ->
     })
 }
 
+fn init_lp_with_passive_matcher_params(
+    env: &mut TradeCpiTestEnv,
+    owner: &Keypair,
+    matcher_prog: &Pubkey,
+    matcher_fee_bps: u32,
+    base_spread_bps: u32,
+    max_total_bps: u32,
+    max_fill_abs: u128,
+) -> (u16, Pubkey) {
+    let idx = env.account_count;
+    env.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+    let ata = env.create_ata(&owner.pubkey(), DEFAULT_INIT_PAYMENT);
+
+    let lp_bytes = idx.to_le_bytes();
+    let (lp_pda, _) =
+        Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
+
+    let ctx = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            ctx,
+            Account {
+                lamports: 10_000_000,
+                data: vec![0u8; MATCHER_CONTEXT_LEN],
+                owner: *matcher_prog,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let init_ix = Instruction {
+        program_id: *matcher_prog,
+        accounts: vec![
+            AccountMeta::new_readonly(lp_pda, false),
+            AccountMeta::new(ctx, false),
+        ],
+        data: encode_init_vamm(
+            MatcherMode::Passive,
+            matcher_fee_bps,
+            base_spread_bps,
+            max_total_bps,
+            0,
+            0,
+            max_fill_abs,
+            0,
+        ),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), init_ix],
+        Some(&owner.pubkey()),
+        &[owner],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("custom matcher context init failed");
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+        ],
+        data: encode_init_lp(matcher_prog, &ctx, DEFAULT_INIT_PAYMENT),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&owner.pubkey()),
+        &[owner],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("custom init_lp failed");
+    env.account_count += 1;
+    (idx, ctx)
+}
+
 #[test]
 fn test_hyperp_after_hours_trade_fee_matches_ewma_mark_movement() {
     let mut env = TradeCpiTestEnv::new();
@@ -6921,6 +7004,72 @@ fn test_hyperp_after_hours_self_deal_mark_move_cannot_create_extractable_claim()
         insurance_after >= insurance_before,
         "self-dealt after-hours mark move drained insurance: before={insurance_before}, after={insurance_after}"
     );
+}
+
+#[test]
+fn test_hyperp_after_hours_self_deal_at_trade_band_cannot_extract() {
+    for size in [100_000_000i128, -100_000_000i128] {
+        let mut env = TradeCpiTestEnv::new();
+        init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
+
+        let matcher_prog = env.matcher_program_id;
+        let lp = Keypair::new();
+        let (lp_idx, matcher_ctx) = init_lp_with_passive_matcher_params(
+            &mut env,
+            &lp,
+            &matcher_prog,
+            5,
+            95,
+            100,
+            20_000_000_000,
+        );
+        env.deposit(&lp, lp_idx, 100_000_000);
+
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 100_000_000);
+
+        let controlled = [lp_idx, user_idx];
+        let claim_before = controlled_extractable_upper_bound(&env, &controlled);
+        let insurance_before = env.read_insurance_balance();
+        let cfg_before = read_market_config(&env);
+
+        env.set_slot(101);
+        env.try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            size,
+            &matcher_prog,
+            &matcher_ctx,
+        )
+        .expect("band-edge after-hours self-deal should execute");
+
+        let cfg_after_trade = read_market_config(&env);
+        assert!(
+            cfg_after_trade.mark_ewma_e6 != cfg_before.mark_ewma_e6,
+            "band-edge self-deal must exercise the after-hours mark path"
+        );
+        assert!(
+            env.read_insurance_balance() > insurance_before,
+            "band-edge self-deal must pay the dynamic mark-movement fee"
+        );
+
+        env.set_slot(102);
+        env.crank();
+
+        let claim_after = controlled_extractable_upper_bound(&env, &controlled);
+        let insurance_after = env.read_insurance_balance();
+        assert!(
+            claim_after <= claim_before,
+            "size {size}: band-edge self-deal created extractable attacker claim: before={claim_before}, after={claim_after}"
+        );
+        assert!(
+            insurance_after >= insurance_before,
+            "size {size}: band-edge self-deal drained insurance: before={insurance_before}, after={insurance_after}"
+        );
+    }
 }
 
 #[test]
