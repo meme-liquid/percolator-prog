@@ -23,6 +23,15 @@ trade_fee_base_bps + max(actual EWMA mark move bps, max_price_move_bps_per_slot)
 
 That charges for the next honest external-oracle step even when the trade executes at the unchanged fallback mark and the EWMA does not move. Both `TradeCpi` and `TradeNoCpi` now assert the fee floor and the post-crank claim bound.
 
+**Follow-up scan:** the same stale-fallback exploit was re-run as a direction/API matrix:
+
+- `TradeCpi`, user long, honest oracle moves one configured step up.
+- `TradeCpi`, user short, honest oracle moves one configured step down.
+- `TradeNoCpi`, user long, honest oracle moves one configured step up.
+- `TradeNoCpi`, user short, honest oracle moves one configured step down.
+
+Regression: `test_attack_external_hybrid_stale_fallback_direction_matrix_cannot_extract`. Each branch asserts the exact two-sided fallback fee and that the user's post-crank extractable claim does not increase. Disposition: `PASS_SAFE`.
+
 ---
 
 # Security findings — 2026-04-22 deep sweep

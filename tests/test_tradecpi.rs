@@ -8409,6 +8409,95 @@ fn test_attack_external_hybrid_tradenocpi_stale_fallback_cannot_extract_lp_value
     );
 }
 
+fn run_external_hybrid_stale_fallback_direction_case(
+    use_cpi: bool,
+    size: i128,
+    fresh_price_e6: i64,
+    label: &str,
+) {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) =
+        init_lp_with_passive_matcher_params(&mut env, &lp, &matcher_prog, 0, 0, 0, 20_000_000_000);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let user_claim_before = controlled_extractable_upper_bound(&env, &[user_idx]);
+    let insurance_before_fallback = env.read_insurance_balance();
+
+    set_tradecpi_clock_only(&mut env, 150);
+    if use_cpi {
+        env.try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            size,
+            &matcher_prog,
+            &matcher_ctx,
+        )
+        .unwrap_or_else(|e| panic!("{label}: TradeCpi stale fallback failed: {e:?}"));
+    } else {
+        try_trade_nocpi_in_tradecpi_env(&mut env, &user, &lp, lp_idx, user_idx, size)
+            .unwrap_or_else(|e| panic!("{label}: TradeNoCpi stale fallback failed: {e:?}"));
+    }
+
+    let insurance_after_fallback = env.read_insurance_balance();
+    let fallback_price = read_market_config(&env).last_effective_price_e6;
+    let expected_uncertainty_fee = two_sided_fee_for_trade(
+        size,
+        fallback_price,
+        1 + read_max_price_move_bps(&env),
+    );
+    assert_eq!(
+        insurance_after_fallback - insurance_before_fallback,
+        expected_uncertainty_fee,
+        "{label}: stale fallback must charge base fee plus the next oracle-step uncertainty floor"
+    );
+
+    set_tradecpi_pyth_price(&mut env, 151, fresh_price_e6, 1);
+    env.crank();
+
+    let user_claim_after = controlled_extractable_upper_bound(&env, &[user_idx]);
+    let insurance_after_crank = env.read_insurance_balance();
+    assert!(
+        user_claim_after <= user_claim_before,
+        "{label}: stale fallback plus honest one-step oracle move created extractable user claim: before={user_claim_before}, after={user_claim_after}"
+    );
+    assert!(
+        insurance_after_crank >= insurance_after_fallback,
+        "{label}: honest post-fallback crank drained insurance: before={insurance_after_fallback}, after={insurance_after_crank}"
+    );
+}
+
+#[test]
+fn test_attack_external_hybrid_stale_fallback_direction_matrix_cannot_extract() {
+    for (use_cpi, size, fresh_price_e6, label) in [
+        (true, 100_000_000, 138_027_600, "TradeCpi long then up"),
+        (true, -100_000_000, 137_972_400, "TradeCpi short then down"),
+        (
+            false,
+            100_000_000,
+            138_027_600,
+            "TradeNoCpi long then up",
+        ),
+        (
+            false,
+            -100_000_000,
+            137_972_400,
+            "TradeNoCpi short then down",
+        ),
+    ] {
+        run_external_hybrid_stale_fallback_direction_case(use_cpi, size, fresh_price_e6, label);
+    }
+}
+
 #[test]
 fn test_external_hybrid_after_hours_band_edge_self_deal_cannot_extract() {
     for size in [10_000_000i128, -10_000_000i128] {
