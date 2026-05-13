@@ -1105,13 +1105,14 @@ fn kani_tradenocpi_universal_characterization() {
 }
 
 /// TradeNoCpi handler gate composition: auth alone is not enough. The public
-/// no-CPI trade path also rejects Hyperp markets, zero/i128::MIN sizes, exposed
-/// account-limited market progress, and raw-target/effective-price lag.
+/// no-CPI trade path also rejects zero/i128::MIN sizes and far-behind
+/// account-limited market progress. It does not reject solely for Hyperp mode
+/// or target/effective lag; consenting trades are the liveness lane and the
+/// engine enforces post-trade health atomically.
 #[kani::proof]
 fn kani_tradenocpi_full_wrapper_gate_composition() {
     let user_auth_ok: bool = kani::any();
     let lp_auth_ok: bool = kani::any();
-    let is_hyperp: bool = kani::any();
     let size: i128 = kani::any();
     let oi_long: u128 = kani::any();
     let oi_short: u128 = kani::any();
@@ -1120,8 +1121,6 @@ fn kani_tradenocpi_full_wrapper_gate_composition() {
     let funding_rate: i128 = kani::any();
     let fund_px_last: u64 = kani::any();
     let dt_slots: u64 = kani::any();
-    let external_target: u64 = kani::any();
-    let engine_last_price_after_accrual: u64 = kani::any();
 
     let auth_accept = decide_trade_nocpi(user_auth_ok, lp_auth_ok) == TradeNoCpiDecision::Accept;
     let size_ok = size != 0 && size != i128::MIN;
@@ -1134,24 +1133,16 @@ fn kani_tradenocpi_full_wrapper_gate_composition() {
         fund_px_last,
         dt_slots,
     );
-    let no_target_lag = user_value_op_allowed_after_accrual(
-        false,
-        external_target,
-        0,
-        engine_last_price_after_accrual,
-    );
 
-    let handler_gate_allows = auth_accept && !is_hyperp && size_ok && accrual_ok && no_target_lag;
+    let handler_gate_allows = auth_accept && size_ok && accrual_ok;
 
     if handler_gate_allows {
         assert!(auth_accept);
-        assert!(!is_hyperp);
         assert!(size_ok);
         assert!(accrual_ok);
-        assert!(no_target_lag);
     } else {
         assert!(
-            !auth_accept || is_hyperp || !size_ok || !accrual_ok || !no_target_lag,
+            !auth_accept || !size_ok || !accrual_ok,
             "TradeNoCpi reject must be explained by one wrapper gate"
         );
     }
@@ -4370,8 +4361,8 @@ fn kani_target_lag_after_read_universal() {
     );
 }
 
-/// Prove: public user value-moving/risk-increasing operations are admitted iff
-/// no raw-target/effective-price lag remains after accrual.
+/// Prove: public extraction-sensitive operations are admitted iff no
+/// raw-target/effective-price lag remains after accrual.
 #[kani::proof]
 fn kani_user_value_op_allowed_iff_no_target_lag() {
     let is_hyperp: bool = kani::any();
@@ -4389,20 +4380,20 @@ fn kani_user_value_op_allowed_iff_no_target_lag() {
 
     assert_eq!(
         allowed, !lag,
-        "user value/risk operation must be allowed iff target lag is absent"
+        "extraction-sensitive operation must be allowed iff target lag is absent"
     );
 }
 
-/// Prove: TradeCpi's pre-CPI policy admits matcher invocation iff the raw
-/// target has already caught up to the effective price returned by the read.
+/// Prove: TradeCpi's pre-CPI policy does not reject solely for raw-target /
+/// effective-price lag. User limits, matcher consent, and engine health checks
+/// are the trade gates; liquidation remains a keeper path.
 #[kani::proof]
-fn kani_trade_cpi_pre_cpi_allowed_iff_no_post_read_lag() {
+fn kani_trade_cpi_pre_cpi_allowed_despite_post_read_lag() {
     let is_hyperp: bool = kani::any();
     let external_target: u64 = kani::any();
     let hyperp_target: u64 = kani::any();
     let effective_price: u64 = kani::any();
 
-    let lag = target_lag_after_read(is_hyperp, external_target, hyperp_target, effective_price);
     let allowed = trade_cpi_allowed_after_oracle_read(
         is_hyperp,
         external_target,
@@ -4410,10 +4401,7 @@ fn kani_trade_cpi_pre_cpi_allowed_iff_no_post_read_lag() {
         effective_price,
     );
 
-    assert_eq!(
-        allowed, !lag,
-        "TradeCpi must invoke matcher only when post-read target lag is absent"
-    );
+    assert!(allowed, "TradeCpi target lag must not block matcher invocation");
 }
 
 // =============================================================================

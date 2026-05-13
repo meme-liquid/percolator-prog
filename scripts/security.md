@@ -1,3 +1,42 @@
+# Security findings — 2026-05-13 hybrid after-hours sweep
+
+## F5 — Hybrid after-hours fallback can be forced during market hours with a stale caller-supplied Pyth account (High)
+
+**Status:** EXPLOIT reproduced locally on commit `ba667e8c68b4dbc4ebf47740bccf59a9aa1ec6a8` plus the current dirty hybrid/TOTO changes.
+
+**Broken check:** `src/percolator.rs:4183-4186` accepts `OracleStale` from the caller-supplied Pyth account as sufficient to enter hybrid EWMA fallback once `hybrid_soft_stale_matured(config, clock_slot)` is true. The soft-stale predicate at `src/percolator.rs:3780-3786` only checks the market-owned `last_good_oracle_slot`; it cannot prove a fresh Pyth Pull update does not exist elsewhere.
+
+**Attacker model:** user controls their signed trade, matcher tail/account choice, and which Pyth Pull PriceUpdate account is supplied. The attacker does not need admin authority. A fresh regular-hours Pyth update exists off-account, but no accepted keeper/user read has refreshed `last_good_oracle_slot` within the hybrid soft-stale window. The attacker supplies an older stale update account, causing the wrapper to trade at the EWMA fallback mark instead of the current external price.
+
+**Reproduction:**
+
+```bash
+cargo test --release --test test_tradecpi \
+  test_attack_external_hybrid_market_hours_stale_account_fallback_cannot_extract_lp_value \
+  -- --nocapture
+```
+
+The red test currently fails with:
+
+```text
+market-hours stale-account fallback created extractable user claim against LP:
+before=10000000099, after=10001380099
+```
+
+**Economic effect:** the user opens a position against an LP at the stale fallback mark. One slot later an honest crank supplies the fresh regular-hours external price, within the configured clamp, and the user's extractable claim increases by `1_380_000` units in the minimal test. The value comes from the LP/counterparty side; no insurance drain was needed for the minimal proof.
+
+**Root cause:** Pyth Pull feeds are caller-supplied accounts. A stale account proves only "this account is stale," not "the feed has no fresh regular-hours update." The hybrid fallback path treats absence of a recent accepted read as an on-chain after-hours proof. That is safe only under a strict keeper freshness assumption; it is not safe as a permissionless proof of market closure.
+
+**Fix direction:** hybrid fallback needs a non-caller-selectable after-hours predicate. Options:
+
+- encode an explicit trading-hours schedule / market-closed predicate in wrapper config and allow EWMA fallback only outside that schedule;
+- require a trusted market-closed oracle/sentinel account;
+- or remove automatic external-to-EWMA fallback and require an explicit mode switch before after-hours trading.
+
+Do not rely on `OracleStale` from a caller-selected Pyth Pull account as proof that the external feed is unavailable.
+
+---
+
 # Security findings — 2026-04-22 deep sweep
 
 Whitehat deep-dive after the `d19a712` fixes landed. All four findings
@@ -1169,8 +1208,9 @@ results. Expanded `tests/test_economic_attack_vectors.rs` to cover
    atomically; capital, position, SPL vault, and engine vault stayed
    unchanged.
 5. **Target/effective-lag trade** — PASS_SAFE.
-   Risk-increasing trade during target lag rejected atomically;
-   positions, capitals, and vault stayed unchanged.
+   Consenting trade during target lag executed atomically; positions
+   changed, external vault balances stayed unchanged, and unsafe
+   post-trade states remain subject to keeper liquidation.
 6. **Whipsaw profit recycling** — PASS_SAFE.
    Attacker withdrew during an up-move, then price reversed; withdrawn
    amount remained offset by controlled-account losses.

@@ -609,7 +609,7 @@ fn test_tradecpi_lp_matcher_binding_isolation() {
 /// 7. Admin closes slab
 #[test]
 fn test_premarket_resolution_full_lifecycle() {
-    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    // Need TradeCpiTestEnv for Hyperp oracle/matcher test helpers.
     let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET RESOLUTION FULL LIFECYCLE TEST ===");
@@ -727,7 +727,7 @@ fn test_premarket_resolution_full_lifecycle() {
 /// Test insurance withdrawal requires all positions closed
 #[test]
 fn test_withdraw_insurance_requires_positions_closed() {
-    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    // Need TradeCpiTestEnv for Hyperp oracle/matcher test helpers.
     let mut env = TradeCpiTestEnv::new();
 
     println!("=== WITHDRAW INSURANCE REQUIRES POSITIONS CLOSED TEST ===");
@@ -809,7 +809,7 @@ fn test_withdraw_insurance_requires_positions_closed() {
 /// Test paginated force-close with many accounts (simulates 4096 worst case)
 #[test]
 fn test_premarket_paginated_force_close() {
-    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    // Need TradeCpiTestEnv for Hyperp oracle/matcher test helpers.
     let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET PAGINATED FORCE-CLOSE TEST ===");
@@ -939,7 +939,7 @@ fn test_premarket_paginated_force_close() {
 /// Test binary outcome: price = 1e-6 (NO wins)
 #[test]
 fn test_premarket_binary_outcome_price_zero() {
-    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    // Need TradeCpiTestEnv for Hyperp oracle/matcher test helpers.
     let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET BINARY OUTCOME PRICE=1e-6 (NO) TEST ===");
@@ -1006,7 +1006,7 @@ fn test_premarket_binary_outcome_price_zero() {
 /// Test binary outcome: price = 1e6 (YES wins)
 #[test]
 fn test_premarket_binary_outcome_price_one() {
-    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    // Need TradeCpiTestEnv for Hyperp oracle/matcher test helpers.
     let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET BINARY OUTCOME PRICE=1 TEST ===");
@@ -1083,7 +1083,7 @@ fn test_premarket_binary_outcome_price_one() {
 /// For 4096 accounts, we need 64 cranks, each under ~22k CUs to stay under 1.4M total.
 #[test]
 fn test_premarket_force_close_cu_benchmark() {
-    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    // Need TradeCpiTestEnv for Hyperp oracle/matcher test helpers.
     let mut env = TradeCpiTestEnv::new();
 
     println!("=== PREMARKET FORCE-CLOSE CU BENCHMARK ===");
@@ -3624,7 +3624,7 @@ fn test_attack_hyperp_mark_price_clamp_defense() {
 /// WithdrawInsurance should fail while positions are still open post-resolve.
 #[test]
 fn test_attack_withdraw_insurance_before_force_close() {
-    // Need TradeCpiTestEnv because hyperp mode disables TradeNoCpi
+    // Need TradeCpiTestEnv for Hyperp oracle/matcher test helpers.
     let mut env = TradeCpiTestEnv::new();
 
     env.init_market_hyperp(1_000_000);
@@ -3646,7 +3646,7 @@ fn test_attack_withdraw_insurance_before_force_close() {
     env.set_slot(100);
     env.crank();
 
-    // Open position via TradeCpi (TradeNoCpi blocked on hyperp)
+    // Open position via TradeCpi; this test specifically covers the matcher path.
     let result = env.try_trade_cpi(
         &user,
         &lp.pubkey(),
@@ -6244,25 +6244,19 @@ fn test_tradecpi_nonzero_fill_requires_crank_for_exposed_price_progress() {
             .unwrap();
     }
 
-    let err = env
-        .try_trade_cpi(
-            &walker_user,
-            &walker_lp.pubkey(),
-            walker_lp_idx,
-            walker_user_idx,
-            1_000,
-            &mp,
-            &walker_matcher_ctx,
-        )
-        .expect_err("nonzero TradeCpi must not be a hidden crank path");
+    env.try_trade_cpi(
+        &walker_user,
+        &walker_lp.pubkey(),
+        walker_lp_idx,
+        walker_user_idx,
+        1_000,
+        &mp,
+        &walker_matcher_ctx,
+    )
+    .expect("nonzero TradeCpi is a consenting liveness path during exposed price progress");
     assert!(
-        err.contains("0x1d"),
-        "TradeCpi exposed progress must surface CatchupRequired, got: {err}",
-    );
-    assert_eq!(
-        read_last_market_slot(&env),
-        slot_before,
-        "rejected TradeCpi must not advance exposed market time",
+        read_last_market_slot(&env) > slot_before,
+        "accepted TradeCpi should advance exposed market time through the engine"
     );
 
     env.crank();
@@ -6743,6 +6737,150 @@ fn init_hyperp_with_dynamic_fee(
     .expect("init hyperp dynamic-fee market failed");
 }
 
+fn init_external_hybrid_with_dynamic_fee(
+    env: &mut TradeCpiTestEnv,
+    max_trading_fee_bps: u64,
+    trade_fee_base_bps: u64,
+    mark_min_fee: u64,
+) {
+    let admin = &env.payer;
+    let mut data = vec![0u8];
+    data.extend_from_slice(admin.pubkey().as_ref());
+    data.extend_from_slice(env.mint.as_ref());
+    data.extend_from_slice(&TEST_FEED_ID);
+    data.extend_from_slice(&10u64.to_le_bytes());
+    data.extend_from_slice(&500u16.to_le_bytes());
+    data.push(0u8); // invert
+    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
+    data.extend_from_slice(&max_trading_fee_bps.to_le_bytes());
+    data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
+    data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
+    data.extend_from_slice(&0u64.to_le_bytes()); // liquidation_fee_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // liquidation_fee_cap
+    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&2u64.to_le_bytes()); // max_price_move_bps_per_slot
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    data.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
+    data.extend_from_slice(&mark_min_fee.to_le_bytes());
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&trade_fee_base_bps.to_le_bytes());
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("init external hybrid dynamic-fee market failed");
+}
+
+fn init_external_hybrid_three_leg_with_dynamic_fee(
+    env: &mut TradeCpiTestEnv,
+    leg2: Pubkey,
+    leg3: Pubkey,
+    leg2_feed: [u8; 32],
+    leg3_feed: [u8; 32],
+    trade_fee_base_bps: u64,
+) {
+    let admin = &env.payer;
+    let mut data = vec![0u8];
+    data.extend_from_slice(admin.pubkey().as_ref());
+    data.extend_from_slice(env.mint.as_ref());
+    data.extend_from_slice(&TEST_FEED_ID);
+    data.extend_from_slice(&10u64.to_le_bytes());
+    data.extend_from_slice(&500u16.to_le_bytes());
+    data.push(0u8); // invert
+    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
+    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
+    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
+    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
+    data.extend_from_slice(&10_000u64.to_le_bytes()); // max_trading_fee_bps
+    data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
+    data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
+    data.extend_from_slice(&50u64.to_le_bytes()); // legacy max_crank_staleness wire field
+    data.extend_from_slice(&0u64.to_le_bytes()); // liquidation_fee_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // liquidation_fee_cap
+    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
+    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
+    data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&2u64.to_le_bytes()); // max_price_move_bps_per_slot
+    data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
+    data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
+    data.extend_from_slice(&80u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
+    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
+    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
+    data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
+    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots
+    data.push(3u8); // oracle_leg_count
+    data.push(
+        percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2
+            | percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG3,
+    );
+    data.extend_from_slice(&leg2_feed);
+    data.extend_from_slice(&leg3_feed);
+    data.extend_from_slice(&trade_fee_base_bps.to_le_bytes());
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(env.mint, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(leg2, false),
+            AccountMeta::new_readonly(leg3, false),
+        ],
+        data,
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&admin.pubkey()),
+        &[admin],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("init three-leg external hybrid market failed");
+}
+
 fn try_init_hyperp_with_dynamic_fee(
     env: &mut TradeCpiTestEnv,
     initial_mark_price_e6: u64,
@@ -6788,6 +6926,217 @@ fn try_init_hyperp_with_dynamic_fee(
 fn read_market_config(env: &TradeCpiTestEnv) -> percolator_prog::state::MarketConfig {
     let slab = env.svm.get_account(&env.slab).unwrap();
     percolator_prog::state::read_config(&slab.data)
+}
+
+fn set_tradecpi_clock_only(env: &mut TradeCpiTestEnv, slot: u64) {
+    env.svm.set_sysvar(&Clock {
+        slot,
+        unix_timestamp: slot as i64,
+        ..Clock::default()
+    });
+}
+
+fn set_tradecpi_pyth_price(env: &mut TradeCpiTestEnv, slot: u64, price_e6: i64, conf_e6: u64) {
+    env.svm.set_sysvar(&Clock {
+        slot,
+        unix_timestamp: slot as i64,
+        ..Clock::default()
+    });
+    let pyth_data = make_pyth_data(&TEST_FEED_ID, price_e6, -6, conf_e6, slot as i64);
+    for oracle in [env.pyth_index, env.pyth_col] {
+        env.svm
+            .set_account(
+                oracle,
+                Account {
+                    lamports: 1_000_000,
+                    data: pyth_data.clone(),
+                    owner: PYTH_RECEIVER_PROGRAM_ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+    }
+}
+
+fn set_pyth_account(
+    env: &mut TradeCpiTestEnv,
+    account: Pubkey,
+    feed_id: &[u8; 32],
+    slot: u64,
+    price_e6: i64,
+    conf_e6: u64,
+) {
+    let pyth_data = make_pyth_data(feed_id, price_e6, -6, conf_e6, slot as i64);
+    env.svm
+        .set_account(
+            account,
+            Account {
+                lamports: 1_000_000,
+                data: pyth_data,
+                owner: PYTH_RECEIVER_PROGRAM_ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+}
+
+fn set_three_leg_pyth_prices(
+    env: &mut TradeCpiTestEnv,
+    leg2: Pubkey,
+    leg3: Pubkey,
+    leg2_feed: &[u8; 32],
+    leg3_feed: &[u8; 32],
+    slot: u64,
+    leg1_price_e6: i64,
+    leg2_price_e6: i64,
+    leg3_price_e6: i64,
+) {
+    env.svm.set_sysvar(&Clock {
+        slot,
+        unix_timestamp: slot as i64,
+        ..Clock::default()
+    });
+    set_pyth_account(env, env.pyth_index, &TEST_FEED_ID, slot, leg1_price_e6, 1);
+    set_pyth_account(env, leg2, leg2_feed, slot, leg2_price_e6, 1);
+    set_pyth_account(env, leg3, leg3_feed, slot, leg3_price_e6, 1);
+}
+
+fn try_trade_nocpi_in_tradecpi_env(
+    env: &mut TradeCpiTestEnv,
+    user: &Keypair,
+    lp: &Keypair,
+    lp_idx: u16,
+    user_idx: u16,
+    size: i128,
+) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_trade(lp_idx, user_idx, size),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&user.pubkey()),
+        &[user, lp],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+fn try_trade_nocpi_with_exec_price_in_tradecpi_env(
+    env: &mut TradeCpiTestEnv,
+    user: &Keypair,
+    lp: &Keypair,
+    lp_idx: u16,
+    user_idx: u16,
+    size: i128,
+    exec_price_e6: u64,
+) -> Result<(), String> {
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(lp.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+        ],
+        data: encode_trade_with_exec_price(lp_idx, user_idx, size, exec_price_e6),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&user.pubkey()),
+        &[user, lp],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+fn try_trade_cpi_with_three_oracles(
+    env: &mut TradeCpiTestEnv,
+    user: &Keypair,
+    lp_owner: &Pubkey,
+    lp_idx: u16,
+    user_idx: u16,
+    size: i128,
+    matcher_prog: &Pubkey,
+    matcher_ctx: &Pubkey,
+    leg2: Pubkey,
+    leg3: Pubkey,
+) -> Result<(), String> {
+    let lp_bytes = lp_idx.to_le_bytes();
+    let (lp_pda, _) =
+        Pubkey::find_program_address(&[b"lp", env.slab.as_ref(), &lp_bytes], &env.program_id);
+
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(user.pubkey(), true),
+            AccountMeta::new(*lp_owner, false),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(leg2, false),
+            AccountMeta::new_readonly(leg3, false),
+            AccountMeta::new_readonly(*matcher_prog, false),
+            AccountMeta::new(*matcher_ctx, false),
+            AccountMeta::new_readonly(lp_pda, false),
+        ],
+        data: encode_trade_cpi(lp_idx, user_idx, size),
+    };
+
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&user.pubkey()),
+        &[user],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .map(|_| ())
+        .map_err(|e| format!("{:?}", e))
+}
+
+fn crank_with_three_oracles(env: &mut TradeCpiTestEnv, leg2: Pubkey, leg3: Pubkey) {
+    let caller = Keypair::new();
+    env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(caller.pubkey(), true),
+            AccountMeta::new(env.slab, false),
+            AccountMeta::new_readonly(sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
+            AccountMeta::new_readonly(leg2, false),
+            AccountMeta::new_readonly(leg3, false),
+        ],
+        data: encode_crank_permissionless(),
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[cu_ix(), ix],
+        Some(&caller.pubkey()),
+        &[&caller],
+        env.svm.latest_blockhash(),
+    );
+    env.svm
+        .send_transaction(tx)
+        .expect("three-leg crank failed");
 }
 
 fn two_sided_fee_for_trade(size_q: i128, exec_price_e6: u64, fee_bps: u64) -> u128 {
@@ -6944,6 +7293,328 @@ fn test_hyperp_after_hours_trade_fee_matches_ewma_mark_movement() {
 }
 
 #[test]
+fn test_static_tradecpi_accepts_consented_wide_exec_price() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = init_lp_with_passive_matcher_params(
+        &mut env,
+        &lp,
+        &matcher_prog,
+        0,
+        500,
+        500,
+        20_000_000_000,
+    );
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000_000);
+
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        10_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("static TradeCpi should accept a matcher-consented wide exec price");
+
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "wide-price TradeCpi must execute, not be pre-rejected by wrapper banding"
+    );
+}
+
+#[test]
+fn test_static_tradenocpi_accepts_consented_wide_exec_price() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+
+    let user_a = Keypair::new();
+    let user_a_idx = env.init_user(&user_a);
+    env.deposit(&user_a, user_a_idx, 1_000_000_000_000);
+
+    let user_b = Keypair::new();
+    let user_b_idx = env.init_user(&user_b);
+    env.deposit(&user_b, user_b_idx, 1_000_000_000_000);
+
+    let cfg = read_market_config(&env);
+    let exec_price = cfg.last_effective_price_e6 * 105 / 100;
+    try_trade_nocpi_with_exec_price_in_tradecpi_env(
+        &mut env,
+        &user_a,
+        &user_b,
+        user_b_idx,
+        user_a_idx,
+        10_000_000,
+        exec_price,
+    )
+    .expect("static bilateral TradeNoCpi should accept a signer-consented wide exec price");
+
+    assert_ne!(
+        env.read_account_position(user_a_idx),
+        0,
+        "wide-price TradeNoCpi must execute, not silently fall back to rejection"
+    );
+}
+
+#[test]
+fn test_external_hybrid_tradenocpi_wide_exec_price_charges_dynamic_fee() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let user_a = Keypair::new();
+    let user_a_idx = env.init_user(&user_a);
+    env.deposit(&user_a, user_a_idx, 1_000_000_000_000);
+
+    let user_b = Keypair::new();
+    let user_b_idx = env.init_user(&user_b);
+    env.deposit(&user_b, user_b_idx, 1_000_000_000_000);
+
+    set_tradecpi_clock_only(&mut env, 150);
+    let cfg_before = read_market_config(&env);
+    let insurance_before = env.read_insurance_balance();
+    let exec_price = cfg_before.last_effective_price_e6 * 105 / 100;
+    let size = 10_000_000i128;
+
+    try_trade_nocpi_with_exec_price_in_tradecpi_env(
+        &mut env,
+        &user_a,
+        &user_b,
+        user_b_idx,
+        user_a_idx,
+        size,
+        exec_price,
+    )
+    .expect("hybrid TradeNoCpi should accept a signer-consented wide exec price");
+
+    let cfg_after = read_market_config(&env);
+    let insurance_after = env.read_insurance_balance();
+    assert!(
+        cfg_after.mark_ewma_e6 > cfg_before.mark_ewma_e6,
+        "wide hybrid NoCpi execution should move the clamped trade-derived mark"
+    );
+    let base_only_fee = two_sided_fee_for_trade(size, exec_price, 1);
+    assert!(
+        insurance_after - insurance_before > base_only_fee,
+        "wide hybrid NoCpi execution must pay more than the static base fee"
+    );
+}
+
+#[test]
+fn test_hyperp_tradenocpi_accepts_consented_exec_price_and_updates_mark() {
+    let mut env = TradeCpiTestEnv::new();
+    init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
+
+    let user_a = Keypair::new();
+    let user_a_idx = env.init_user(&user_a);
+    env.deposit(&user_a, user_a_idx, 1_000_000_000_000);
+
+    let user_b = Keypair::new();
+    let user_b_idx = env.init_user(&user_b);
+    env.deposit(&user_b, user_b_idx, 1_000_000_000_000);
+
+    env.set_slot(101);
+    let cfg_before = read_market_config(&env);
+    let insurance_before = env.read_insurance_balance();
+    let exec_price = cfg_before.last_effective_price_e6 * 105 / 100;
+    let size = 10_000_000i128;
+
+    try_trade_nocpi_with_exec_price_in_tradecpi_env(
+        &mut env,
+        &user_a,
+        &user_b,
+        user_b_idx,
+        user_a_idx,
+        size,
+        exec_price,
+    )
+    .expect("Hyperp TradeNoCpi should accept a signer-consented exec price");
+
+    let cfg_after = read_market_config(&env);
+    assert!(
+        cfg_after.mark_ewma_e6 > cfg_before.mark_ewma_e6,
+        "Hyperp NoCpi must feed the agreed price into the clamped EWMA mark"
+    );
+    assert!(
+        cfg_after.last_mark_push_slot > cfg_before.last_mark_push_slot,
+        "Hyperp NoCpi full-weight trade must refresh mark liveness"
+    );
+    assert!(
+        env.read_insurance_balance() > insurance_before,
+        "Hyperp NoCpi wide execution must charge the dynamic mark fee"
+    );
+}
+
+#[test]
+fn test_external_tradecpi_executes_while_oracle_target_lags_effective_price() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) =
+        init_lp_with_passive_matcher_params(&mut env, &lp, &matcher_prog, 0, 500, 500, 20_000_000);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000_000);
+
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("initial TradeCpi should create exposed OI");
+
+    let cfg_before = read_market_config(&env);
+    set_tradecpi_pyth_price(
+        &mut env,
+        101,
+        (cfg_before.last_effective_price_e6 as i64) * 105 / 100,
+        1,
+    );
+
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        10_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("TradeCpi should execute while raw oracle target is ahead of capped effective price");
+
+    let cfg_after = read_market_config(&env);
+    assert_ne!(
+        cfg_after.oracle_target_price_e6, cfg_after.last_effective_price_e6,
+        "test must leave target/effective lag in place"
+    );
+    assert_ne!(env.read_account_position(user_idx), 0);
+}
+
+#[test]
+fn test_external_tradenocpi_executes_while_oracle_target_lags_effective_price() {
+    let mut env = TradeCpiTestEnv::new();
+    env.init_market();
+
+    let user_a = Keypair::new();
+    let user_a_idx = env.init_user(&user_a);
+    env.deposit(&user_a, user_a_idx, 1_000_000_000_000);
+
+    let user_b = Keypair::new();
+    let user_b_idx = env.init_user(&user_b);
+    env.deposit(&user_b, user_b_idx, 1_000_000_000_000);
+
+    try_trade_nocpi_in_tradecpi_env(
+        &mut env,
+        &user_a,
+        &user_b,
+        user_b_idx,
+        user_a_idx,
+        1_000_000,
+    )
+    .expect("initial TradeNoCpi should create exposed OI");
+
+    let cfg_before = read_market_config(&env);
+    let target = cfg_before.last_effective_price_e6 * 105 / 100;
+    set_tradecpi_pyth_price(&mut env, 101, target as i64, 1);
+
+    try_trade_nocpi_with_exec_price_in_tradecpi_env(
+        &mut env,
+        &user_a,
+        &user_b,
+        user_b_idx,
+        user_a_idx,
+        10_000_000,
+        target,
+    )
+    .expect("TradeNoCpi should execute while raw oracle target is ahead of capped effective price");
+
+    let cfg_after = read_market_config(&env);
+    assert_ne!(
+        cfg_after.oracle_target_price_e6, cfg_after.last_effective_price_e6,
+        "test must leave target/effective lag in place"
+    );
+    assert_ne!(env.read_account_position(user_a_idx), 0);
+}
+
+#[test]
+fn test_hyperp_trades_execute_while_target_lags_effective_index() {
+    let mut env = TradeCpiTestEnv::new();
+    init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
+
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_authority(&admin, &admin.pubkey())
+        .expect("set hyperp mark authority");
+    env.try_push_oracle_price(&admin, 1_050_000, 100)
+        .expect("push target mark");
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) =
+        init_lp_with_passive_matcher_params(&mut env, &lp, &matcher_prog, 0, 500, 500, 20_000_000);
+    env.deposit(&lp, lp_idx, 1_000_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000_000);
+
+    env.set_slot(101);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        10_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("Hyperp TradeCpi should execute while mark target is ahead of capped index");
+
+    let cfg_after_cpi = read_market_config(&env);
+    assert_ne!(
+        cfg_after_cpi.hyperp_mark_e6, cfg_after_cpi.last_effective_price_e6,
+        "test must leave Hyperp target/effective lag in place"
+    );
+    assert_ne!(env.read_account_position(user_idx), 0);
+
+    let user_b = Keypair::new();
+    let user_b_idx = env.init_user(&user_b);
+    env.deposit(&user_b, user_b_idx, 1_000_000_000_000);
+    let user_c = Keypair::new();
+    let user_c_idx = env.init_user(&user_c);
+    env.deposit(&user_c, user_c_idx, 1_000_000_000_000);
+
+    env.set_slot(102);
+    let exec_price = cfg_after_cpi.hyperp_mark_e6;
+    try_trade_nocpi_with_exec_price_in_tradecpi_env(
+        &mut env,
+        &user_b,
+        &user_c,
+        user_c_idx,
+        user_b_idx,
+        10_000_000,
+        exec_price,
+    )
+    .expect("Hyperp TradeNoCpi should also execute while target/effective lag remains");
+    assert_ne!(env.read_account_position(user_b_idx), 0);
+}
+
+#[test]
 fn test_hyperp_after_hours_self_deal_mark_move_cannot_create_extractable_claim() {
     let mut env = TradeCpiTestEnv::new();
     init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
@@ -7021,11 +7692,11 @@ fn test_hyperp_after_hours_self_deal_at_trade_band_cannot_extract() {
             100,
             20_000_000_000,
         );
-        env.deposit(&lp, lp_idx, 100_000_000);
+        env.deposit(&lp, lp_idx, 1_000_000_000_000);
 
         let user = Keypair::new();
         let user_idx = env.init_user(&user);
-        env.deposit(&user, user_idx, 100_000_000);
+        env.deposit(&user, user_idx, 1_000_000_000_000);
 
         let controlled = [lp_idx, user_idx];
         let claim_before = controlled_extractable_upper_bound(&env, &controlled);
@@ -7147,6 +7818,675 @@ fn test_hyperp_after_hours_mark_stays_static_until_trade_then_fee_rises() {
 }
 
 #[test]
+fn test_external_hybrid_switches_to_ewma_mark_after_oracle_soft_stale() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let cfg_init = read_market_config(&env);
+    assert_ne!(
+        cfg_init.index_feed_id, [0u8; 32],
+        "hybrid mode keeps the external feed id; it is not Hyperp mode"
+    );
+    assert_eq!(
+        cfg_init.mark_ewma_e6, cfg_init.last_effective_price_e6,
+        "hybrid fallback mark must seed from the initial external price"
+    );
+
+    // Move past the soft-stale window without changing the Pyth account.
+    // The wrapper must not move the mark just because the oracle became stale.
+    set_tradecpi_clock_only(&mut env, 150);
+    let cfg_before_crank = read_market_config(&env);
+    env.crank();
+    let cfg_after_crank = read_market_config(&env);
+    assert_eq!(
+        cfg_after_crank.mark_ewma_e6, cfg_before_crank.mark_ewma_e6,
+        "stale-oracle fallback must not move the EWMA mark without a trade"
+    );
+    assert_eq!(
+        cfg_after_crank.last_good_oracle_slot, cfg_before_crank.last_good_oracle_slot,
+        "a stale caller-supplied Pyth account must not refresh external liveness"
+    );
+
+    let insurance_before = env.read_insurance_balance();
+    let size = 100_000_000i128;
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        size,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("hybrid after-hours trade should execute against EWMA fallback");
+
+    let cfg_after_trade = read_market_config(&env);
+    let insurance_after = env.read_insurance_balance();
+    let mark_move_bps = percolator_prog::policy::price_move_bps_ceil(
+        cfg_after_crank.mark_ewma_e6,
+        cfg_after_trade.mark_ewma_e6,
+    )
+    .unwrap();
+    assert!(
+        mark_move_bps > 0,
+        "after-hours hybrid trade must move the fee-weighted EWMA mark"
+    );
+    let exec_price = cfg_after_crank.last_effective_price_e6 * 10_015 / 10_000;
+    let base_only_fee = two_sided_fee_for_trade(size, exec_price, 1);
+    let expected_fee = two_sided_fee_for_trade(size, exec_price, 1 + mark_move_bps);
+    assert!(
+        insurance_after - insurance_before > base_only_fee,
+        "dynamic hybrid fee must rise above the normal base fee when the mark moves"
+    );
+    assert_eq!(
+        insurance_after - insurance_before,
+        expected_fee,
+        "hybrid after-hours fee should be base fee plus actual EWMA mark movement"
+    );
+}
+
+#[test]
+fn test_external_hybrid_caller_chosen_stale_update_does_not_force_early_fallback() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Pyth publish_time remains 100. At slot 115, the account is stale by
+    // wall-clock max_staleness_secs=10, but the wrapper's own last-good
+    // external-read slot has not crossed the 3x soft-stale fallback window.
+    // A caller-selected old Pyth account must therefore fail, not switch modes.
+    set_tradecpi_clock_only(&mut env, 115);
+    let cfg_before = read_market_config(&env);
+    let res = env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    );
+    assert!(
+        res.is_err(),
+        "hybrid fallback must not be triggered solely by a caller-supplied stale Pyth account"
+    );
+    let cfg_after = read_market_config(&env);
+    assert_eq!(
+        cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
+        "rejected early-stale attempt must not mutate the fallback mark"
+    );
+    assert_eq!(
+        cfg_after.last_good_oracle_slot, cfg_before.last_good_oracle_slot,
+        "rejected early-stale attempt must not refresh liveness"
+    );
+}
+
+#[test]
+fn test_external_hybrid_soft_stale_boundary_is_strict() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Init stamps last_good_oracle_slot=100 and max_staleness_secs=10, so the
+    // hybrid soft-stale threshold is 30 slots. At exactly +30, fallback is not
+    // mature; at +31, the same stale external account may fall back to EWMA.
+    set_tradecpi_clock_only(&mut env, 130);
+    let at_boundary_before = read_market_config(&env);
+    let boundary_res = env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    );
+    assert!(
+        boundary_res.is_err(),
+        "hybrid fallback must not trigger at the exact soft-stale boundary"
+    );
+    let at_boundary_after = read_market_config(&env);
+    assert_eq!(
+        at_boundary_after.mark_ewma_e6, at_boundary_before.mark_ewma_e6,
+        "rejected boundary attempt must not move the EWMA mark"
+    );
+    assert_eq!(
+        at_boundary_after.last_good_oracle_slot, at_boundary_before.last_good_oracle_slot,
+        "rejected boundary attempt must not refresh external liveness"
+    );
+
+    set_tradecpi_clock_only(&mut env, 131);
+    env.svm.expire_blockhash();
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("hybrid fallback should trigger one slot past the soft-stale boundary");
+    let after_fallback = read_market_config(&env);
+    assert_eq!(
+        after_fallback.last_good_oracle_slot, at_boundary_before.last_good_oracle_slot,
+        "EWMA fallback must not pretend a stale external account was fresh"
+    );
+    assert_ne!(
+        after_fallback.mark_ewma_e6, at_boundary_before.mark_ewma_e6,
+        "first post-boundary trade should exercise the after-hours mark path"
+    );
+}
+
+#[test]
+fn test_external_hybrid_fresh_oracle_after_after_hours_resets_fallback_baseline() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    set_tradecpi_clock_only(&mut env, 150);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("soft-stale hybrid trade should use EWMA fallback");
+    let after_hours_cfg = read_market_config(&env);
+    assert!(
+        after_hours_cfg.mark_ewma_e6 != after_hours_cfg.last_effective_price_e6,
+        "test setup must leave a trade-derived after-hours mark distinct from the external index"
+    );
+
+    // A fresh external update after the after-hours interval must switch the
+    // same market back to oracle mode and reset the fallback mark baseline to
+    // the accepted external staircase price. This prevents after-hours EWMA
+    // state from bleeding into regular-hours pricing.
+    set_tradecpi_pyth_price(&mut env, 160, 138_100_000, 1);
+    env.crank();
+    let regular_hours_cfg = read_market_config(&env);
+    assert_eq!(
+        regular_hours_cfg.last_good_oracle_slot, 160,
+        "fresh external oracle read must refresh the market-owned liveness cursor"
+    );
+    assert_eq!(
+        regular_hours_cfg.mark_ewma_e6, regular_hours_cfg.last_effective_price_e6,
+        "fresh external oracle read must reset the after-hours EWMA baseline"
+    );
+    assert_eq!(
+        regular_hours_cfg.hyperp_mark_e6, regular_hours_cfg.last_effective_price_e6,
+        "hybrid fallback mark cache should track the regular-hours external baseline"
+    );
+    assert_eq!(
+        regular_hours_cfg.oracle_target_price_e6, 138_100_000,
+        "raw external target should be retained separately from the clamped effective price"
+    );
+}
+
+#[test]
+fn test_external_hybrid_three_leg_layout_transitions_to_after_hours() {
+    let mut env = TradeCpiTestEnv::new();
+    let leg2 = env.pyth_col;
+    let leg3 = Pubkey::new_unique();
+    let leg2_feed = [0x22u8; 32];
+    let leg3_feed = [0x33u8; 32];
+
+    // Compose engine price as leg1 / leg2 / leg3. Keeping leg2 and leg3
+    // at 1.0 makes the integration test focus on the handler's shifted
+    // account layout while unit tests cover nontrivial TOTO/SOL arithmetic.
+    set_three_leg_pyth_prices(
+        &mut env,
+        leg2,
+        leg3,
+        &leg2_feed,
+        &leg3_feed,
+        100,
+        138_000_000,
+        1_000_000,
+        1_000_000,
+    );
+    init_external_hybrid_three_leg_with_dynamic_fee(&mut env, leg2, leg3, leg2_feed, leg3_feed, 1);
+    let cfg_init = read_market_config(&env);
+    assert_eq!(cfg_init.oracle_leg_count, 3);
+    assert_eq!(
+        cfg_init.oracle_leg_flags,
+        percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2
+            | percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG3
+    );
+    assert_eq!(cfg_init.last_effective_price_e6, 138_000_000);
+    assert_eq!(
+        cfg_init.mark_ewma_e6, cfg_init.last_effective_price_e6,
+        "three-leg hybrid must seed fallback mark from the external composite"
+    );
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    set_three_leg_pyth_prices(
+        &mut env,
+        leg2,
+        leg3,
+        &leg2_feed,
+        &leg3_feed,
+        110,
+        139_000_000,
+        1_000_000,
+        1_000_000,
+    );
+    crank_with_three_oracles(&mut env, leg2, leg3);
+    let cfg_regular = read_market_config(&env);
+    assert_eq!(cfg_regular.last_good_oracle_slot, 110);
+    assert_eq!(cfg_regular.oracle_target_price_e6, 139_000_000);
+    assert_eq!(
+        cfg_regular.mark_ewma_e6, cfg_regular.last_effective_price_e6,
+        "fresh three-leg composite must reset the after-hours fallback baseline"
+    );
+
+    set_tradecpi_clock_only(&mut env, 150);
+    let insurance_before = env.read_insurance_balance();
+    try_trade_cpi_with_three_oracles(
+        &mut env,
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+        leg2,
+        leg3,
+    )
+    .expect("three-leg hybrid should trade through shifted TradeCpi account layout");
+    let cfg_after = read_market_config(&env);
+    assert_eq!(
+        cfg_after.last_good_oracle_slot, cfg_regular.last_good_oracle_slot,
+        "after-hours fallback from stale three-leg accounts must not refresh external liveness"
+    );
+    assert_ne!(
+        cfg_after.mark_ewma_e6, cfg_regular.mark_ewma_e6,
+        "after-hours three-leg trade must move the fee-weighted EWMA mark"
+    );
+    assert!(
+        env.read_insurance_balance() > insurance_before,
+        "after-hours three-leg trade must pay a dynamic mark-movement fee"
+    );
+}
+
+#[test]
+fn test_external_hybrid_conf_wide_update_does_not_trigger_after_hours_fallback() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Soft-stale has matured, but the supplied account is fresh with
+    // excessive confidence, not stale. Hybrid fallback is intentionally
+    // limited to stale external accounts; wide-conf updates are bad data,
+    // not proof that the market is after-hours.
+    set_tradecpi_pyth_price(&mut env, 150, 138_000_000, 10_000_000);
+    let cfg_before = read_market_config(&env);
+    let res = env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    );
+    assert!(
+        res.is_err(),
+        "fresh but confidence-too-wide oracle data must not trigger EWMA fallback"
+    );
+    let cfg_after = read_market_config(&env);
+    assert_eq!(
+        cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
+        "rejected wide-confidence update must not mutate the fallback mark"
+    );
+    assert_eq!(
+        cfg_after.last_good_oracle_slot, cfg_before.last_good_oracle_slot,
+        "rejected wide-confidence update must not refresh external liveness"
+    );
+}
+
+#[test]
+fn test_external_hybrid_hard_stale_blocks_trading_and_allows_permissionless_resolve() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    set_tradecpi_clock_only(&mut env, 181);
+    let err = env
+        .try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            100_000_000,
+            &matcher_prog,
+            &matcher_ctx,
+        )
+        .expect_err("hard-stale hybrid market must stop live price-taking trades");
+    assert!(
+        err.contains("0x6") || err.contains("OracleStale"),
+        "hard-stale trade should fail with OracleStale, got: {err}"
+    );
+    assert!(
+        !env.is_market_resolved(),
+        "failed live trade must not resolve the market as a side effect"
+    );
+
+    env.try_resolve_permissionless()
+        .expect("hard-stale hybrid market should have a permissionless exit");
+    assert!(
+        env.is_market_resolved(),
+        "permissionless resolve must terminally resolve the hard-stale market"
+    );
+}
+
+#[test]
+fn test_external_hybrid_after_hours_self_deal_cannot_create_extractable_claim() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let controlled = [lp_idx, user_idx];
+    let claim_before = controlled_extractable_upper_bound(&env, &controlled);
+    let insurance_before = env.read_insurance_balance();
+    let cfg_before = read_market_config(&env);
+
+    set_tradecpi_clock_only(&mut env, 150);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("hybrid after-hours self-deal should execute with dynamic fee");
+    let cfg_after_trade = read_market_config(&env);
+    assert!(
+        cfg_after_trade.mark_ewma_e6 != cfg_before.mark_ewma_e6,
+        "test setup must move the after-hours EWMA mark"
+    );
+    assert!(
+        env.read_insurance_balance() > insurance_before,
+        "hybrid self-deal must pay the dynamic mark-movement fee"
+    );
+
+    set_tradecpi_clock_only(&mut env, 151);
+    env.crank();
+
+    let claim_after = controlled_extractable_upper_bound(&env, &controlled);
+    let insurance_after = env.read_insurance_balance();
+    assert!(
+        claim_after <= claim_before,
+        "hybrid after-hours self-deal created extractable attacker claim: before={claim_before}, after={claim_after}"
+    );
+    assert!(
+        insurance_after >= insurance_before,
+        "hybrid after-hours self-deal drained insurance: before={insurance_before}, after={insurance_after}"
+    );
+}
+
+#[test]
+fn test_attack_external_hybrid_market_hours_stale_account_fallback_cannot_extract_lp_value() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) =
+        init_lp_with_passive_matcher_params(&mut env, &lp, &matcher_prog, 0, 0, 0, 20_000_000_000);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let user_claim_before = controlled_extractable_upper_bound(&env, &[user_idx]);
+
+    // Simulate market hours with a fresh update available elsewhere, but the
+    // attacker supplies the stale update account already stored in env.pyth_index.
+    // If the wrapper treats "caller supplied stale account after soft-stale"
+    // as sufficient proof of after-hours mode, the user can open at the stale
+    // EWMA mark before the honest crank installs the current external price.
+    set_tradecpi_clock_only(&mut env, 150);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("stale-account hybrid fallback trade currently succeeds");
+
+    // The honest crank then supplies the fresh regular-hours price one slot
+    // later. Keep the move inside the configured 2 bps/slot clamp so this is
+    // not relying on a rejected target-lag state.
+    set_tradecpi_pyth_price(&mut env, 151, 138_027_600, 1);
+    env.crank();
+
+    let user_claim_after = controlled_extractable_upper_bound(&env, &[user_idx]);
+    assert!(
+        user_claim_after <= user_claim_before,
+        "market-hours stale-account fallback created extractable user claim against LP: before={user_claim_before}, after={user_claim_after}"
+    );
+}
+
+#[test]
+fn test_external_hybrid_after_hours_band_edge_self_deal_cannot_extract() {
+    for size in [10_000_000i128, -10_000_000i128] {
+        let mut env = TradeCpiTestEnv::new();
+        init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+        let matcher_prog = env.matcher_program_id;
+        let lp = Keypair::new();
+        let (lp_idx, matcher_ctx) = init_lp_with_passive_matcher_params(
+            &mut env,
+            &lp,
+            &matcher_prog,
+            5,
+            95,
+            100,
+            20_000_000_000,
+        );
+        env.deposit(&lp, lp_idx, 1_000_000_000_000);
+
+        let user = Keypair::new();
+        let user_idx = env.init_user(&user);
+        env.deposit(&user, user_idx, 1_000_000_000_000);
+
+        let controlled = [lp_idx, user_idx];
+        let claim_before = controlled_extractable_upper_bound(&env, &controlled);
+        let insurance_before = env.read_insurance_balance();
+        let cfg_before = read_market_config(&env);
+
+        set_tradecpi_clock_only(&mut env, 150);
+        env.try_trade_cpi(
+            &user,
+            &lp.pubkey(),
+            lp_idx,
+            user_idx,
+            size,
+            &matcher_prog,
+            &matcher_ctx,
+        )
+        .expect("hybrid band-edge self-deal should execute");
+
+        let cfg_after_trade = read_market_config(&env);
+        assert!(
+            cfg_after_trade.mark_ewma_e6 != cfg_before.mark_ewma_e6,
+            "size {size}: band-edge self-deal must exercise the hybrid mark path"
+        );
+        assert!(
+            env.read_insurance_balance() > insurance_before,
+            "size {size}: band-edge self-deal must pay the dynamic mark-movement fee"
+        );
+
+        set_tradecpi_clock_only(&mut env, 151);
+        env.crank();
+
+        let claim_after = controlled_extractable_upper_bound(&env, &controlled);
+        let insurance_after = env.read_insurance_balance();
+        assert!(
+            claim_after <= claim_before,
+            "size {size}: hybrid band-edge self-deal created extractable attacker claim: before={claim_before}, after={claim_after}"
+        );
+        assert!(
+            insurance_after >= insurance_before,
+            "size {size}: hybrid band-edge self-deal drained insurance: before={insurance_before}, after={insurance_after}"
+        );
+    }
+}
+
+#[test]
+fn test_external_hybrid_same_mark_tradenocpi_cannot_pin_dynamic_fee_clock() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, _matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    set_tradecpi_clock_only(&mut env, 150);
+    let cfg_before = read_market_config(&env);
+    try_trade_nocpi_in_tradecpi_env(&mut env, &user, &lp, lp_idx, user_idx, 1_000_000)
+        .expect("same-mark hybrid TradeNoCpi should execute bilaterally");
+
+    let cfg_after = read_market_config(&env);
+    assert_eq!(
+        cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
+        "same-mark TradeNoCpi must not move the hybrid EWMA mark"
+    );
+    assert_eq!(
+        cfg_after.mark_ewma_last_slot, cfg_before.mark_ewma_last_slot,
+        "same-mark TradeNoCpi must not pin the EWMA clock and cheapen a later dynamic-fee trade"
+    );
+    assert_eq!(
+        cfg_after.last_good_oracle_slot, cfg_before.last_good_oracle_slot,
+        "stale after-hours TradeNoCpi must not refresh external oracle liveness"
+    );
+}
+
+#[test]
+fn test_external_hybrid_same_mark_tradecpi_cannot_pin_dynamic_fee_clock() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, matcher_ctx) =
+        init_lp_with_passive_matcher_params(&mut env, &lp, &matcher_prog, 0, 0, 0, 20_000_000_000);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    set_tradecpi_clock_only(&mut env, 150);
+    let cfg_before = read_market_config(&env);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("same-mark hybrid TradeCpi should execute through a zero-spread matcher");
+
+    let cfg_after = read_market_config(&env);
+    assert_eq!(
+        cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
+        "same-mark TradeCpi must not move the hybrid EWMA mark"
+    );
+    assert_eq!(
+        cfg_after.mark_ewma_last_slot, cfg_before.mark_ewma_last_slot,
+        "same-mark TradeCpi must not pin the EWMA clock and cheapen a later dynamic-fee trade"
+    );
+    assert_eq!(
+        cfg_after.last_good_oracle_slot, cfg_before.last_good_oracle_slot,
+        "stale after-hours TradeCpi must not refresh external oracle liveness"
+    );
+}
+
+#[test]
 fn test_hyperp_after_hours_same_price_wash_trade_cannot_pin_liveness_clock() {
     let mut env = TradeCpiTestEnv::new();
     init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
@@ -7258,35 +8598,24 @@ fn test_hyperp_after_hours_tiny_fill_rejects_only_above_engine_hard_bound() {
     env.set_slot(102);
     let cfg_before = read_market_config(&env);
     let insurance_before = env.read_insurance_balance();
-    let err = env
-        .try_trade_cpi(
-            &user,
-            &lp.pubkey(),
-            lp_idx,
-            user_idx,
-            1_000_000, // tiny fill relative to the now-open book
-            &matcher_prog,
-            &matcher_ctx,
-        )
-        .expect_err("tiny fill should reject when required fee exceeds hard bound");
-
-    assert!(
-        err.contains("InvalidConfigParam") || err.contains("custom program error"),
-        "unexpected rejection: {err}"
-    );
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        1_000_000, // tiny fill relative to the now-open book
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("tiny fill should execute when the dynamic fee stays within the hard bound");
     let cfg_after = read_market_config(&env);
-    assert_eq!(
-        cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
-        "rejected tiny-fill attack must not move the EWMA mark"
+    assert!(
+        cfg_after.mark_ewma_e6 >= cfg_before.mark_ewma_e6,
+        "accepted tiny fill must preserve monotone test-side EWMA movement"
     );
-    assert_eq!(
-        cfg_after.last_mark_push_slot, cfg_before.last_mark_push_slot,
-        "rejected tiny-fill attack must not refresh Hyperp liveness"
-    );
-    assert_eq!(
-        env.read_insurance_balance(),
-        insurance_before,
-        "rejected tiny-fill attack must not collect fees"
+    assert!(
+        env.read_insurance_balance() > insurance_before,
+        "accepted tiny fill must still collect the configured dynamic trade fee"
     );
 }
 
@@ -7530,10 +8859,6 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
         "market must still be live before perm_resolve maturity"
     );
 
-    // User risk changes are now conservatively blocked while the Hyperp
-    // target/effective price has not caught up. The important liveness
-    // property here is that the market remains live and recoverable, not
-    // that same-slot extraction can bypass target lag.
     let lagged_trade = env.try_trade_cpi(
         &user,
         &lp.pubkey(),
@@ -7544,13 +8869,13 @@ fn test_hyperp_never_has_pre_resolve_unrecoverable_window() {
         &matcher_ctx,
     );
     assert!(
-        lagged_trade.is_err(),
-        "TradeCpi must wait for target catchup after a fresh push: {:?}",
+        lagged_trade.is_ok(),
+        "TradeCpi must remain live while target/effective lag exists: {:?}",
         lagged_trade
     );
     assert!(
         !env.is_market_resolved(),
-        "target-lag rejection must not resolve the market"
+        "target-lag trading must not resolve the market"
     );
 }
 

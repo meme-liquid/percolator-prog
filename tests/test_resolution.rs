@@ -822,7 +822,7 @@ fn test_admin_force_close_admin_only() {
 /// -> InitUser+Deposit -> ResolveMarket -> resolved Crank -> AdminForceCloseAccount
 /// -> WithdrawInsurance -> CloseSlab.
 ///
-/// No trading (TradeNoCpi is blocked on Hyperp), focuses on admin lifecycle.
+/// No trading in this test; it focuses on admin lifecycle.
 #[test]
 fn test_hyperp_full_lifecycle_init_to_close_slab() {
     program_path();

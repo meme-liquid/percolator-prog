@@ -313,6 +313,13 @@ pub mod constants {
     /// must reserve the full headroom so a deployer-supplied cap cannot be used
     /// to halt after-hours trading exactly when the mark-movement fee is needed.
     pub const MAX_DYNAMIC_TRADE_FEE_BPS: u64 = 10_000;
+    /// Static trade-fee mode: no after-hours EWMA fallback.
+    pub const TRADE_FEE_MODE_STATIC: u64 = 0;
+    /// External-oracle market with dynamic after-hours EWMA fallback enabled.
+    /// This is set only when InitMarket explicitly reserves fee headroom with
+    /// `trade_fee_base_bps < RiskParams::max_trading_fee_bps` on a non-Hyperp
+    /// market. Plain low-fee external markets remain static.
+    pub const TRADE_FEE_MODE_HYBRID_AFTER_HOURS: u64 = 1;
 
     /// External oracle composition supports up to 3 Pyth/Chainlink legs.
     /// Leg 1 is the existing `index_feed_id`; legs 2/3 are optional InitMarket
@@ -800,8 +807,11 @@ pub mod policy {
     }
 
     /// True when the latest oracle read produced an effective engine price that
-    /// still has not caught up to the raw target. TradeCpi uses this before CPI
-    /// so a matcher is not invoked for a trade the wrapper must reject anyway.
+    /// still has not caught up to the raw target. This is diagnostic policy:
+    /// trades no longer reject solely for target/effective lag because both
+    /// counterparties consent to the execution price and the engine enforces
+    /// post-trade health. Extraction-sensitive paths still use
+    /// `target_lag_pending` after accrual.
     #[inline]
     pub fn target_lag_after_read(
         is_hyperp: bool,
@@ -817,8 +827,8 @@ pub mod policy {
         target != 0 && target != effective_price_e6
     }
 
-    /// Public extraction-sensitive/risk-increasing user operations are allowed
-    /// only after the raw target has caught up to the engine's effective price.
+    /// Public extraction-sensitive operations are allowed only after the raw
+    /// target has caught up to the engine's effective price.
     #[inline]
     pub fn user_value_op_allowed_after_accrual(
         is_hyperp: bool,
@@ -834,20 +844,20 @@ pub mod policy {
         )
     }
 
-    /// Pre-CPI TradeCpi admission under raw-target/effective-price lag policy.
+    /// TradeCpi admission under raw-target/effective-price lag policy.
+    ///
+    /// Matcher invocation is intentionally not gated by lag: consenting trades
+    /// are a liveness path when the effective engine price is walking toward a
+    /// fresh target. The engine either accepts the agreed execution under its
+    /// margin rules or rejects atomically; liquidation remains a keeper path.
     #[inline]
     pub fn trade_cpi_allowed_after_oracle_read(
-        is_hyperp: bool,
-        external_oracle_target_price_e6: u64,
-        hyperp_target_price_e6: u64,
-        effective_price_e6: u64,
+        _is_hyperp: bool,
+        _external_oracle_target_price_e6: u64,
+        _hyperp_target_price_e6: u64,
+        _effective_price_e6: u64,
     ) -> bool {
-        !target_lag_after_read(
-            is_hyperp,
-            external_oracle_target_price_e6,
-            hyperp_target_price_e6,
-            effective_price_e6,
-        )
+        true
     }
 
     /// Account index must be inside both the compiled hard cap and the
@@ -1955,6 +1965,12 @@ pub mod ix {
             lp_idx: u16,
             user_idx: u16,
             size: i128,
+            /// Optional engine-space execution price. 0 preserves the
+            /// legacy bilateral path that fills at the wrapper's current
+            /// effective price. Nonzero means both signers agree to the
+            /// supplied price; the engine still enforces health and the
+            /// wrapper clamps mark impact separately.
+            exec_price_e6: u64,
         },
         CloseAccount {
             user_idx: u16,
@@ -2308,10 +2324,20 @@ pub mod ix {
                     let lp_idx = read_u16(&mut rest)?;
                     let user_idx = read_u16(&mut rest)?;
                     let size = read_i128(&mut rest)?;
+                    let exec_price_e6 = if rest.is_empty() {
+                        0
+                    } else {
+                        let p = read_u64(&mut rest)?;
+                        if !rest.is_empty() {
+                            return Err(ProgramError::InvalidInstructionData);
+                        }
+                        p
+                    };
                     Ok(Instruction::TradeNoCpi {
                         lp_idx,
                         user_idx,
                         size,
+                        exec_price_e6,
                     })
                 }
                 // Tag 7 (LiquidateAtOracle) retired. Liquidation is routed
@@ -2888,7 +2914,9 @@ pub mod state {
         /// EWMA mark movement it causes. Defaults to max_trading_fee_bps for
         /// legacy/static-fee markets.
         pub trade_fee_base_bps: u64,
-        pub _trade_fee_padding: u64,
+        /// Wrapper trade-fee mode. Reuses the former padding slot, so the
+        /// persisted layout is unchanged.
+        pub trade_fee_mode: u64,
         /// Minimum slots after resolution before permissionless force-close.
         /// 0 = disabled. Set at InitMarket, immutable.
         pub force_close_delay_slots: u64,
@@ -3757,6 +3785,37 @@ pub mod oracle {
         config.index_feed_id == [0u8; 32]
     }
 
+    /// Hybrid after-hours mode: an external-oracle market that reserves the
+    /// dynamic Hyperp fee headroom. Fresh external reads own the index during
+    /// market hours; after the wrapper's own last-good external read becomes
+    /// soft-stale, price-taking paths fall back to the trade-derived EWMA mark
+    /// and charge the dynamic mark-movement fee.
+    #[inline]
+    pub fn is_hybrid_after_hours_mode(config: &super::state::MarketConfig) -> bool {
+        !is_hyperp_mode(config)
+            && config.trade_fee_mode == crate::constants::TRADE_FEE_MODE_HYBRID_AFTER_HOURS
+    }
+
+    #[inline]
+    pub fn hybrid_soft_stale_matured(config: &super::state::MarketConfig, clock_slot: u64) -> bool {
+        if !is_hybrid_after_hours_mode(config) {
+            return false;
+        }
+        let max_stale_slots = config.max_staleness_secs.saturating_mul(3);
+        clock_slot.saturating_sub(config.last_good_oracle_slot) > max_stale_slots
+    }
+
+    #[inline]
+    pub fn hybrid_after_hours_target(config: &super::state::MarketConfig) -> u64 {
+        if config.mark_ewma_e6 > 0 {
+            config.mark_ewma_e6
+        } else if config.hyperp_mark_e6 > 0 {
+            config.hyperp_mark_e6
+        } else {
+            config.last_effective_price_e6
+        }
+    }
+
     /// Hard-timeout predicate: has the market's configured oracle been
     /// stale for >= permissionless_resolve_stale_slots?
     ///
@@ -4130,7 +4189,7 @@ pub mod processor {
         // must not stamp the liveness cursor on those — otherwise an
         // attacker can replay an old Pyth account to extend market
         // life past `permissionless_resolve_stale_slots`.
-        let price_advanced = oracle::read_price_clamped(
+        let price_advanced = match oracle::read_price_clamped(
             config,
             oracle_accounts,
             clock_unix_ts,
@@ -4138,10 +4197,50 @@ pub mod processor {
             p_last,
             price_move_dt_slots,
             oi_any,
-        )?;
+        ) {
+            Ok(v) => v,
+            Err(e)
+                if e == ProgramError::from(PercolatorError::OracleStale)
+                    && oracle::hybrid_soft_stale_matured(config, clock_slot) =>
+            {
+                let target = oracle::hybrid_after_hours_target(config);
+                if target == 0 {
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
+                let anchor = if p_last != 0 {
+                    p_last
+                } else if config.last_effective_price_e6 != 0 {
+                    config.last_effective_price_e6
+                } else {
+                    target
+                };
+                let price = oracle::effective_price_from_target(
+                    anchor,
+                    target,
+                    max_change_bps,
+                    price_move_dt_slots,
+                    oi_any,
+                );
+                config.oracle_target_price_e6 = target;
+                config.last_effective_price_e6 = price;
+                if price != anchor || price == target {
+                    config.last_hyperp_index_slot = clock_slot;
+                }
+                return Ok(price);
+            }
+            Err(e) => return Err(e),
+        };
         let (price, advanced) = price_advanced;
         if advanced {
             config.last_good_oracle_slot = clock_slot;
+            if oracle::is_hybrid_after_hours_mode(config) {
+                // During regular hours, the trusted external composite is the
+                // mark baseline. This makes the stale fallback start from the
+                // last accepted real price instead of an old after-hours EWMA.
+                config.hyperp_mark_e6 = price;
+                config.mark_ewma_e6 = price;
+                config.mark_ewma_last_slot = clock_slot;
+            }
         }
         Ok(price)
     }
@@ -4446,15 +4545,6 @@ pub mod processor {
         Ok(())
     }
 
-    fn target_lag_after_read(config: &MarketConfig, effective_price: u64) -> bool {
-        !crate::policy::trade_cpi_allowed_after_oracle_read(
-            oracle::is_hyperp_mode(config),
-            config.oracle_target_price_e6,
-            hyperp_target_price(config),
-            effective_price,
-        )
-    }
-
     #[inline]
     fn engine_is_resolved(engine: &RiskEngine) -> bool {
         engine.market_mode == percolator::MarketMode::Resolved
@@ -4563,6 +4653,54 @@ pub mod processor {
         one_side_fee
             .checked_mul(2)
             .ok_or_else(|| PercolatorError::EngineOverflow.into())
+    }
+
+    fn trade_fee_bps_for_execution(
+        config: &MarketConfig,
+        engine: &RiskEngine,
+        now_slot: u64,
+        oracle_price: u64,
+        exec_price: u64,
+        trade_size: i128,
+    ) -> Result<u64, ProgramError> {
+        let dynamic_mark_fee_enabled = (oracle::is_hyperp_mode(config)
+            || oracle::is_hybrid_after_hours_mode(config))
+            && config.trade_fee_base_bps < engine.params.max_trading_fee_bps;
+        if !dynamic_mark_fee_enabled {
+            return Ok(config.trade_fee_base_bps);
+        }
+
+        let trade_notional = safe_mul_div_floor_u128(
+            trade_size.unsigned_abs(),
+            exec_price as u128,
+            percolator::POS_SCALE,
+        )?;
+        let clamped_exec = oracle::clamp_oracle_price(
+            crate::policy::mark_ewma_clamp_base(config.last_effective_price_e6),
+            exec_price,
+            engine.params.max_price_move_bps_per_slot,
+        );
+        let max_side_oi_q = core::cmp::max(engine.oi_eff_long_q, engine.oi_eff_short_q);
+        let max_side_notional = safe_mul_div_ceil_u128(
+            max_side_oi_q,
+            oracle_price as u128,
+            percolator::POS_SCALE,
+        )?;
+        let mark_externality_notional = core::cmp::max(max_side_notional, trade_notional)
+            .checked_mul(2)
+            .ok_or(PercolatorError::EngineOverflow)?;
+        crate::policy::hyperp_dynamic_fee_bps(
+            config.trade_fee_base_bps,
+            config.mark_ewma_e6,
+            clamped_exec,
+            config.mark_ewma_halflife_slots,
+            config.mark_ewma_last_slot,
+            now_slot,
+            trade_notional,
+            mark_externality_notional,
+            config.mark_min_fee,
+        )
+        .ok_or(PercolatorError::InvalidConfigParam.into())
     }
 
     fn safe_mul_div_floor_u128(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
@@ -5480,9 +5618,19 @@ pub mod processor {
         maintenance_fee_per_slot: u128,
         mark_min_fee: u64,
         trade_fee_base_bps: u64,
+        max_trading_fee_bps: u64,
         force_close_delay_slots: u64,
         new_account_fee: u128,
     ) {
+        let hybrid_after_hours = !is_hyperp && trade_fee_base_bps < max_trading_fee_bps;
+        let uses_trade_mark = is_hyperp || hybrid_after_hours;
+        let initial_trade_mark_e6 = if is_hyperp {
+            initial_mark_price_e6
+        } else if hybrid_after_hours {
+            init_price
+        } else {
+            0
+        };
         let config = MarketConfig {
             collateral_mint: mint_key.to_bytes(),
             vault_pubkey: vault_key.to_bytes(),
@@ -5506,7 +5654,7 @@ pub mod processor {
             } else {
                 [0u8; 32]
             },
-            hyperp_mark_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
+            hyperp_mark_e6: initial_trade_mark_e6,
             last_oracle_publish_time: init_publish_time,
             last_effective_price_e6: if is_hyperp {
                 initial_mark_price_e6
@@ -5526,8 +5674,8 @@ pub mod processor {
             last_mark_push_slot: if is_hyperp { clock_slot as u128 } else { 0 },
             last_insurance_withdraw_slot: 0,
             insurance_withdraw_deposit_remaining: 0,
-            mark_ewma_e6: if is_hyperp { initial_mark_price_e6 } else { 0 },
-            mark_ewma_last_slot: if is_hyperp { clock_slot } else { 0 },
+            mark_ewma_e6: initial_trade_mark_e6,
+            mark_ewma_last_slot: if uses_trade_mark { clock_slot } else { 0 },
             mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
             init_restart_slot: {
                 use solana_program::sysvar::last_restart_slot::LastRestartSlot;
@@ -5543,7 +5691,11 @@ pub mod processor {
             fee_sweep_cursor_bit: 0,
             mark_min_fee,
             trade_fee_base_bps,
-            _trade_fee_padding: 0,
+            trade_fee_mode: if hybrid_after_hours {
+                crate::constants::TRADE_FEE_MODE_HYBRID_AFTER_HOURS
+            } else {
+                crate::constants::TRADE_FEE_MODE_STATIC
+            },
             force_close_delay_slots,
             new_account_fee,
         };
@@ -6115,14 +6267,17 @@ pub mod processor {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
         if trade_fee_base_bps < risk_params.max_trading_fee_bps {
-            // Dynamic mark-movement fees are Hyperp-only. External-oracle
-            // markets use the static fee both for engine fee collection and
-            // for the off-market execution band; allowing `base < max` there
-            // would create a low-fee market with an artificially wide matcher
-            // price band.
-            if !is_hyperp
-                || risk_params.max_trading_fee_bps != crate::constants::MAX_DYNAMIC_TRADE_FEE_BPS
-            {
+            // Dynamic mark-movement fees are enabled by reserving the engine's
+            // full fee headroom and setting a lower normal base fee. This is
+            // valid for:
+            //   - Hyperp markets (`index_feed_id == 0`), and
+            //   - hybrid after-hours external markets, where fresh oracle
+            //     reads own the index and stale reads fall back to EWMA mark.
+            //
+            // Do not allow a smaller deployer cap: if the dynamic surcharge
+            // cannot fit, the trade must reject rather than silently underpay
+            // the mark-movement externality.
+            if risk_params.max_trading_fee_bps != crate::constants::MAX_DYNAMIC_TRADE_FEE_BPS {
                 return Err(PercolatorError::InvalidConfigParam.into());
             }
         }
@@ -6296,6 +6451,7 @@ pub mod processor {
             maintenance_fee_per_slot,
             mark_min_fee,
             trade_fee_base_bps,
+            risk_params.max_trading_fee_bps,
             force_close_delay_slots,
             new_account_fee,
         );
@@ -7516,6 +7672,7 @@ pub mod processor {
                 lp_idx,
                 user_idx,
                 size,
+                exec_price_e6,
             } => {
                 accounts::expect_len_min(accounts, 5)?;
                 let a_user = &accounts[0];
@@ -7548,26 +7705,45 @@ pub mod processor {
 
                 let clock = Clock::from_account_info(&accounts[3])?;
 
-                // Hyperp mode: reject TradeNoCpi to prevent mark price manipulation
-                // All trades must go through TradeCpi with a pinned matcher
-                if oracle::is_hyperp_mode(&config) {
-                    return Err(PercolatorError::HyperpTradeNoCpiDisabled.into());
-                }
-
                 // Capture pre-read funding rate for anti-retroactivity (§5.5)
                 let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
 
-                // Read the signed oracle price and let the engine enforce caps.
-                let price = read_price_and_stamp(
-                    &mut config,
-                    oracle_accounts,
-                    clock.unix_timestamp,
-                    clock.slot,
-                    &mut data,
-                )?;
+                let is_hyperp = oracle::is_hyperp_mode(&config);
+                let price = if is_hyperp {
+                    let engine = zc::engine_ref(&data)?;
+                    let price_move_dt = price_move_residual_dt(engine, clock.slot)?;
+                    let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
+                    oracle::get_engine_oracle_price_e6(
+                        engine.last_oracle_price,
+                        price_move_dt,
+                        clock.slot,
+                        clock.unix_timestamp,
+                        &mut config,
+                        oracle_accounts,
+                        engine.params.max_price_move_bps_per_slot,
+                        oi_any,
+                    )?
+                } else {
+                    // Read the signed oracle price and let the engine enforce caps.
+                    read_price_and_stamp(
+                        &mut config,
+                        oracle_accounts,
+                        clock.unix_timestamp,
+                        clock.slot,
+                        &mut data,
+                    )?
+                };
                 state::write_config(&mut data, &config);
 
                 let engine = zc::engine_mut(&mut data)?;
+                let exec_price = if exec_price_e6 == 0 {
+                    price
+                } else {
+                    exec_price_e6
+                };
+                if exec_price == 0 || exec_price > percolator::MAX_ORACLE_PRICE {
+                    return Err(PercolatorError::OracleInvalid.into());
+                }
 
                 check_idx(engine, lp_idx)?;
                 check_idx(engine, user_idx)?;
@@ -7588,17 +7764,12 @@ pub mod processor {
 
                 // Side-mode gating is handled inside engine.execute_trade_not_atomic()
 
-                // Exposed market progress belongs to KeeperCrank. If this
-                // account-limited trade is allowed to proceed, accrue to
-                // clock.slot before the engine trade touch.
-                ensure_market_accrued_to_now_for_account_limited_op(
-                    engine,
-                    &config,
-                    clock.slot,
-                    price,
-                    funding_rate_e9,
-                )?;
-                reject_any_target_lag(&config, engine)?;
+                // Trades are a liveness path for the two consenting
+                // counterparties. The engine accrues to the current effective
+                // price, then either accepts the agreed execution price under
+                // its health rules or rejects atomically. Other extraction
+                // paths remain target-lag gated.
+                ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
 
                 // Make both counterparties authoritative, then sync recurring
                 // fees before the trade's fee-current margin checks. This
@@ -7624,8 +7795,16 @@ pub mod processor {
                 // delta undercounts the actual fee. This is the conservative direction:
                 // mark is stickier during volatile loss-absorption events, never
                 // more manipulable. A future engine API could expose fee_paid directly.
+                let current_trade_fee_bps = trade_fee_bps_for_execution(
+                    &config,
+                    engine,
+                    clock.slot,
+                    price,
+                    exec_price,
+                    size,
+                )?;
                 let current_fee_paid_cap =
-                    current_trade_fee_paid_cap(size, price, config.trade_fee_base_bps)?;
+                    current_trade_fee_paid_cap(size, exec_price, current_trade_fee_bps)?;
                 let ins_before = engine.insurance_fund.balance.get();
 
                 #[cfg(feature = "cu-audit")]
@@ -7635,30 +7814,32 @@ pub mod processor {
                 }
                 execute_trade_with_matcher(
                     engine,
-                    &NoOpMatcher,
+                    &CpiMatcher {
+                        exec_price,
+                        exec_size: size,
+                    },
                     lp_idx,
                     user_idx,
                     clock.slot,
                     price,
                     size,
                     funding_rate_e9,
-                    0, // NoOpMatcher ignores lp_account_id
-                    config.trade_fee_base_bps,
+                    0, // bilateral matcher shim ignores lp_account_id
+                    current_trade_fee_bps,
                     0,
                 )
                 .map_err(map_risk_error)?;
 
-                // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
-                // NOTE: NoOpMatcher fills at oracle price, so mark_ewma converges to oracle
-                // for TradeNoCpi trades. This means TradeNoCpi-only markets have zero premium
-                // and zero funding. Markets that need funding must use TradeCpi with a matcher
-                // that can set exec_price != oracle (creating mark/index divergence).
+                // Update mark EWMA from the agreed execution price. The mark
+                // impact is clamped independently from execution price, so
+                // bilateral NoCpi and matcher Cpi trades share the same
+                // price-flexibility semantics.
                 // Per-slot price-move cap is init-immutable (engine RiskParams).
                 let max_change_bps = engine.params.max_price_move_bps_per_slot;
                 if max_change_bps > 0 {
                     let clamped_price = oracle::clamp_oracle_price(
                         crate::policy::mark_ewma_clamp_base(config.last_effective_price_e6),
-                        price,
+                        exec_price,
                         max_change_bps,
                     );
                     // fee_paid = actual fee collected into insurance (post - pre).
@@ -7689,21 +7870,30 @@ pub mod processor {
                         fee_paid_nocpi,
                         config.mark_min_fee,
                     );
-                    // Only full-weight observations advance the EWMA clock
-                    // (Finding 7). Sub-threshold trades can still nudge the
-                    // EWMA value via partial alpha, but their clock bump
-                    // would make the clock a liveness signal attackers can
-                    // cheaply refresh — and on Hyperp markets the soft-
-                    // staleness check reads `max(mark_ewma_last_slot,
-                    // last_mark_push_slot)`, so any clock bump on dust
-                    // trades keeps an otherwise-dead Hyperp market live.
-                    // Gating on full-weight collapses the two-clock
-                    // dichotomy: both clocks now only refresh on
-                    // observation-eligible fills.
+                    let trade_mark_moved_nocpi = config.mark_ewma_e6 != old_ewma;
+                    // Only full-weight observations that actually move the
+                    // EWMA advance the EWMA clock. Sub-threshold trades can
+                    // still nudge the EWMA value via partial alpha, but their
+                    // clock bump would make the clock a liveness/fee signal
+                    // attackers can cheaply refresh. Same-price TradeNoCpi
+                    // fills are especially important in hybrid after-hours
+                    // mode: they execute at the fallback mark, so advancing
+                    // the clock without mark movement would cheapen the next
+                    // dynamic-fee TradeCpi by shrinking its EWMA elapsed time.
                     let full_weight_observation_nocpi =
                         config.mark_min_fee == 0 || fee_paid_nocpi >= config.mark_min_fee;
-                    if full_weight_observation_nocpi {
+                    if full_weight_observation_nocpi && trade_mark_moved_nocpi {
                         config.mark_ewma_last_slot = clock.slot;
+                    }
+                    if is_hyperp {
+                        config.hyperp_mark_e6 = oracle::clamp_oracle_price(
+                            config.last_effective_price_e6,
+                            exec_price,
+                            max_change_bps,
+                        );
+                        if full_weight_observation_nocpi && trade_mark_moved_nocpi {
+                            config.last_mark_push_slot = clock.slot as u128;
+                        }
                     }
                     // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
                     // handles it via the funding_rate parameter (§5.5 anti-retroactivity).
@@ -7984,21 +8174,6 @@ pub mod processor {
                     price
                 };
 
-                if target_lag_after_read(&config, price) {
-                    return Err(PercolatorError::CatchupRequired.into());
-                }
-                // Reject before matcher CPI if this trade would be the hidden
-                // progress path for unrelated exposed accounts.
-                {
-                    let data = a_slab.try_borrow_data()?;
-                    reject_account_limited_market_progress(
-                        zc::engine_ref(&*data)?,
-                        clock.slot,
-                        price,
-                        funding_rate_e9_pre,
-                    )?;
-                }
-
                 // Note: We don't zero the matcher_ctx before CPI because we don't own it.
                 // Security is maintained by ABI validation which checks req_id (nonce),
                 // lp_account_id, and oracle_price_e6 all match the request parameters.
@@ -8203,56 +8378,18 @@ pub mod processor {
                     return Err(PercolatorError::OracleInvalid.into());
                 }
 
-                // Anti-off-market execution policy (§14.3):
-                // |exec_price - oracle_price| * 10_000 <= band * oracle_price.
-                //
-                // Dynamic Hyperp markets reserve the engine's full 10_000 bps
-                // fee headroom so the mark-movement fee cannot be deployer-
-                // capped into a liveness attack. Do NOT use that hard fee
-                // headroom as the matcher price band; doing so would admit
-                // effectively arbitrary off-market fills. Dynamic Hyperp uses
-                // the configured per-slot price step as its economic band
-                // (with the historical 1% minimum), while legacy/static
-                // markets keep the old max(2 * max_trading_fee_bps, 100) rule.
-                if exec_price > 0 && price > 0 {
-                    let band_bps = {
-                        let data_ref = a_slab.try_borrow_data()?;
-                        let engine_ref = zc::engine_ref(&data_ref)?;
-                        if is_hyperp
-                            && config.trade_fee_base_bps < engine_ref.params.max_trading_fee_bps
-                        {
-                            core::cmp::max(engine_ref.params.max_price_move_bps_per_slot, 100)
-                        } else {
-                            let fee_bps = engine_ref.params.max_trading_fee_bps;
-                            core::cmp::max(fee_bps.saturating_mul(2), 100)
-                        }
-                    };
-                    let diff = if exec_price > price {
-                        exec_price - price
-                    } else {
-                        price - exec_price
-                    };
-                    // diff * 10_000 <= band_bps * price (both sides u128 to avoid overflow)
-                    let lhs = (diff as u128).saturating_mul(10_000);
-                    let rhs = (band_bps as u128).saturating_mul(price as u128);
-                    if lhs > rhs {
-                        return Err(PercolatorError::OracleInvalid.into());
-                    }
-                }
                 {
                     let mut data = state::slab_data_mut(a_slab)?;
                     let engine = zc::engine_mut(&mut data)?;
 
-                    // Exposed market progress belongs to KeeperCrank. If this
-                    // account-limited trade is allowed to proceed, accrue to
-                    // clock.slot before the engine trade touch.
-                    ensure_market_accrued_to_now_for_account_limited_op(
-                        engine,
-                        &config,
-                        clock.slot,
-                        price,
-                        funding_rate_e9_pre,
-                    )?;
+                    // Trades are a liveness path for the two consenting
+                    // counterparties. The engine accrues to the current
+                    // effective price, then either accepts the matcher price
+                    // under its health rules or rejects atomically. The
+                    // wrapper no longer applies an oracle-relative execution
+                    // band: user limits and matcher policy express consent,
+                    // while mark impact is clamped separately below.
+                    ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9_pre)?;
 
                     // Same loss-senior fee-current policy as TradeNoCpi:
                     // touch/settle both counterparties first, then charge
@@ -8274,45 +8411,14 @@ pub mod processor {
                     if trade_size.unsigned_abs() > percolator::MAX_TRADE_SIZE_Q {
                         return Err(ProgramError::InvalidInstructionData);
                     }
-                    let trade_notional = safe_mul_div_floor_u128(
-                        trade_size.unsigned_abs(),
-                        exec_price as u128,
-                        percolator::POS_SCALE,
+                    let current_trade_fee_bps = trade_fee_bps_for_execution(
+                        &config,
+                        engine,
+                        clock.slot,
+                        price,
+                        exec_price,
+                        trade_size,
                     )?;
-                    let dynamic_hyperp_fee_enabled =
-                        is_hyperp && config.trade_fee_base_bps < engine.params.max_trading_fee_bps;
-                    let current_trade_fee_bps = if dynamic_hyperp_fee_enabled {
-                        let clamped_exec = oracle::clamp_oracle_price(
-                            crate::policy::mark_ewma_clamp_base(config.last_effective_price_e6),
-                            exec_price,
-                            engine.params.max_price_move_bps_per_slot,
-                        );
-                        let max_side_oi_q =
-                            core::cmp::max(engine.oi_eff_long_q, engine.oi_eff_short_q);
-                        let max_side_notional = safe_mul_div_ceil_u128(
-                            max_side_oi_q,
-                            price as u128,
-                            percolator::POS_SCALE,
-                        )?;
-                        let mark_externality_notional =
-                            core::cmp::max(max_side_notional, trade_notional)
-                                .checked_mul(2)
-                                .ok_or(PercolatorError::EngineOverflow)?;
-                        crate::policy::hyperp_dynamic_fee_bps(
-                            config.trade_fee_base_bps,
-                            config.mark_ewma_e6,
-                            clamped_exec,
-                            config.mark_ewma_halflife_slots,
-                            config.mark_ewma_last_slot,
-                            clock.slot,
-                            trade_notional,
-                            mark_externality_notional,
-                            config.mark_min_fee,
-                        )
-                        .ok_or(PercolatorError::InvalidConfigParam)?
-                    } else {
-                        config.trade_fee_base_bps
-                    };
                     let current_fee_paid_cap =
                         current_trade_fee_paid_cap(trade_size, exec_price, current_trade_fee_bps)?;
 

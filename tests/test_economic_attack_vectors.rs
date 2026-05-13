@@ -540,10 +540,12 @@ fn test_attack_target_lag_withdraw_rejected_atomically() {
     assert_eq!(env.read_engine_vault(), engine_vault_before);
 }
 
-/// Risk-increasing trades must fail atomically while raw oracle target and
-/// effective engine price diverge.
+/// Consenting trades remain a liveness path while raw oracle target and
+/// effective engine price diverge. The wrapper must not block on lag alone:
+/// either the engine accepts the agreed execution atomically, or unsafe
+/// positions remain available to keeper liquidation.
 #[test]
-fn test_attack_target_lag_trade_rejected_atomically() {
+fn test_target_lag_trade_executes_without_external_value_movement() {
     let mut env = TestEnv::new();
     env.init_market_with_cap(0, 100);
 
@@ -568,13 +570,27 @@ fn test_attack_target_lag_trade_rejected_atomically() {
 
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
     assert!(
-        result.is_err(),
-        "trade during target/effective lag must reject"
+        result.is_ok(),
+        "trade during target/effective lag should execute when both sides consent: {result:?}"
     );
-    assert_eq!(env.read_account_position(user_idx), user_pos_before);
-    assert_eq!(env.read_account_position(lp_idx), lp_pos_before);
-    assert_eq!(env.read_account_capital(user_idx), user_cap_before);
-    assert_eq!(env.read_account_capital(lp_idx), lp_cap_before);
+    assert_ne!(
+        env.read_account_position(user_idx),
+        user_pos_before,
+        "accepted target-lag trade must update the user position"
+    );
+    assert_ne!(
+        env.read_account_position(lp_idx),
+        lp_pos_before,
+        "accepted target-lag trade must update the counterparty position"
+    );
+    assert!(
+        env.read_account_capital(user_idx) <= user_cap_before,
+        "accepted trade may charge fees but must not mint user capital"
+    );
+    assert!(
+        env.read_account_capital(lp_idx) <= lp_cap_before,
+        "accepted trade may charge fees but must not mint LP capital"
+    );
     assert_eq!(env.vault_balance(), vault_before);
 }
 

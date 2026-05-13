@@ -692,8 +692,9 @@ fn test_attack_trade_risk_increase_when_gated() {
     );
 }
 
-/// ATTACK: Execute TradeNoCpi in Hyperp mode (should be blocked).
-/// Expected: Program rejects TradeNoCpi for Hyperp markets.
+/// TradeNoCpi is a bilateral path in every market mode. Hyperp no longer
+/// blocks it at the wrapper layer: both account owners consent by signing,
+/// and the engine still enforces health while mark impact is clamped.
 #[test]
 fn test_attack_trade_nocpi_in_hyperp_mode() {
     program_path();
@@ -709,48 +710,33 @@ fn test_attack_trade_nocpi_in_hyperp_mode() {
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
-    let user_pos_before = env.read_account_position(user_idx);
-    let lp_pos_before = env.read_account_position(lp_idx);
-    let user_cap_before = env.read_account_capital(user_idx);
-    let lp_cap_before = env.read_account_capital(lp_idx);
     let spl_vault_before = env.vault_balance();
     let engine_vault_before = env.read_engine_vault();
 
-    // Try TradeNoCpi (tag 6) - should be blocked in Hyperp mode
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 1_000_000);
     assert!(
-        result.is_err(),
-        "ATTACK: TradeNoCpi in Hyperp mode should be blocked"
+        result.is_ok(),
+        "Hyperp TradeNoCpi should execute when both account owners sign: {result:?}"
     );
-    assert_eq!(
+    assert_ne!(
         env.read_account_position(user_idx),
-        user_pos_before,
-        "Rejected Hyperp TradeNoCpi must preserve user position"
+        0,
+        "Accepted Hyperp TradeNoCpi must update user position"
     );
-    assert_eq!(
+    assert_ne!(
         env.read_account_position(lp_idx),
-        lp_pos_before,
-        "Rejected Hyperp TradeNoCpi must preserve LP position"
-    );
-    assert_eq!(
-        env.read_account_capital(user_idx),
-        user_cap_before,
-        "Rejected Hyperp TradeNoCpi must preserve user capital"
-    );
-    assert_eq!(
-        env.read_account_capital(lp_idx),
-        lp_cap_before,
-        "Rejected Hyperp TradeNoCpi must preserve LP capital"
+        0,
+        "Accepted Hyperp TradeNoCpi must update counterparty position"
     );
     assert_eq!(
         env.vault_balance(),
         spl_vault_before,
-        "Rejected Hyperp TradeNoCpi must preserve SPL vault"
+        "Hyperp TradeNoCpi must not move SPL vault tokens"
     );
     assert_eq!(
         env.read_engine_vault(),
         engine_vault_before,
-        "Rejected Hyperp TradeNoCpi must preserve engine vault"
+        "Hyperp TradeNoCpi must preserve engine vault accounting"
     );
 }
 
@@ -7039,8 +7025,8 @@ fn test_attack_resolve_then_withdraw_capital() {
     let _ = env.try_close_account(&lp, lp_idx);
 }
 
-/// ATTACK: TradeNoCpi on hyperp market should always be blocked.
-/// Hyperp mode blocks TradeNoCpi (requires TradeCpi from matcher).
+/// Hyperp TradeNoCpi remains protected by bilateral signatures and engine
+/// health checks. It is not LP-gated and does not require a matcher.
 #[test]
 fn test_attack_trade_nocpi_on_hyperp_rejected() {
     program_path();
@@ -7062,48 +7048,33 @@ fn test_attack_trade_nocpi_on_hyperp_rejected() {
     env.deposit(&user, user_idx, 5_000_000_000);
 
     env.crank();
-    let user_pos_before = env.read_account_position(user_idx);
-    let lp_pos_before = env.read_account_position(lp_idx);
-    let user_cap_before = env.read_account_capital(user_idx);
-    let lp_cap_before = env.read_account_capital(lp_idx);
     let spl_vault_before = env.vault_balance();
     let engine_vault_before = env.read_engine_vault();
 
-    // TradeNoCpi should be blocked on hyperp markets
     let result = env.try_trade(&user, &lp, lp_idx, user_idx, 100_000);
     assert!(
-        result.is_err(),
-        "ATTACK: TradeNoCpi on hyperp market should be rejected!"
+        result.is_ok(),
+        "Hyperp TradeNoCpi should execute when both account owners sign: {result:?}"
     );
-    assert_eq!(
+    assert_ne!(
         env.read_account_position(user_idx),
-        user_pos_before,
-        "Rejected TradeNoCpi on hyperp must preserve user position"
+        0,
+        "Accepted TradeNoCpi on hyperp must update user position"
     );
-    assert_eq!(
+    assert_ne!(
         env.read_account_position(lp_idx),
-        lp_pos_before,
-        "Rejected TradeNoCpi on hyperp must preserve LP position"
-    );
-    assert_eq!(
-        env.read_account_capital(user_idx),
-        user_cap_before,
-        "Rejected TradeNoCpi on hyperp must preserve user capital"
-    );
-    assert_eq!(
-        env.read_account_capital(lp_idx),
-        lp_cap_before,
-        "Rejected TradeNoCpi on hyperp must preserve LP capital"
+        0,
+        "Accepted TradeNoCpi on hyperp must update counterparty position"
     );
     assert_eq!(
         env.vault_balance(),
         spl_vault_before,
-        "Rejected TradeNoCpi on hyperp must preserve SPL vault"
+        "Hyperp TradeNoCpi must not move SPL vault tokens"
     );
     assert_eq!(
         env.read_engine_vault(),
         engine_vault_before,
-        "Rejected TradeNoCpi on hyperp must preserve engine vault"
+        "Hyperp TradeNoCpi must preserve engine vault accounting"
     );
 }
 

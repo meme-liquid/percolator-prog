@@ -246,8 +246,25 @@ Hyperp is an alternative pricing mode for markets that use an internal mark/inde
 - **Mark and index prices**: maintained entirely within the engine; no external oracle feed required for mark settlement.
 - **Premium-based funding**: funding accrues based on the spread between mark and index (premium), scaled by a K-coefficient. The K-coefficient mechanism replaces direct funding rate computation.
 - **Rate-limited index smoothing**: index price updates are clamped per slot via `clamp_toward_with_dt`, preventing instant mark-to-index jumps. When `dt = 0` or cap is zero, the function returns `index` unchanged (no movement).
-- **Mark price clamping on trade execution**: the execution mark is clamped against the index price to enforce the premium band on every trade.
-- **TradeNoCpi disabled**: `TradeNoCpi` is rejected in Hyperp mode; all trades must go through `TradeCpi`.
+- **Execution-price consent**: `TradeCpi` and `TradeNoCpi` both allow counterparties to agree on an execution price. The wrapper clamps mark/index impact and charges dynamic mark-movement fees; it does not reject solely because the agreed execution is away from the current effective price.
+- **Bilateral no-CPI trading**: `TradeNoCpi` is available in Hyperp and external-oracle markets when both account owners sign. `TradeCpi` adds matcher-program authorization, but the price-flexibility policy is the same.
+
+### Hybrid after-hours mode
+
+Hybrid after-hours mode is a single external-oracle configuration with dynamic mark-movement fees:
+
+- `index_feed_id != [0; 32]`
+- optional oracle legs 2/3 compose a synthetic price, for example `1306/SOL = 1306/JPY / USD/JPY / SOL/USD`
+- `RiskParams.max_trading_fee_bps = 10_000`
+- `trade_fee_base_bps < max_trading_fee_bps`
+
+While the external oracle is fresh, the wrapper uses the external composite as the index and refreshes the fallback mark baseline to that accepted external price. If the supplied Pyth update is stale but the market's own `last_good_oracle_slot` has not crossed the soft-stale window, the wrapper rejects instead of falling back; a caller-chosen stale account is not proof that the feed is after-hours. Once the soft-stale window has elapsed, price-taking paths fall back to the fee-weighted EWMA mark and `TradeCpi` charges:
+
+```text
+current_fee_bps >= trade_fee_base_bps + bps(actual EWMA mark movement)
+```
+
+The hard `permissionless_resolve_stale_slots` timer remains independent. If that hard timer matures, live price-taking paths stop and the market exits through permissionless resolution.
 
 ---
 
@@ -336,7 +353,7 @@ Relevant wrapper anchors include:
 
 - clamp law: `kani_effective_price_zero_oi_adopts_target` and the clamp staircase proofs in `tests/kani.rs`
 - "user path rejects, crank progresses" policy: `kani_issue33_exposed_price_move_rejected_by_user_paths_but_crank_progresses` and `kani_issue33_exposed_funding_rejected_by_user_paths_but_crank_progresses`
-- target/effective lag gates: `kani_target_lag_pending_universal`, `kani_target_lag_after_read_universal`, and `kani_user_value_op_allowed_iff_no_target_lag`
+- target/effective lag gates: `kani_target_lag_pending_universal`, `kani_target_lag_after_read_universal`, `kani_user_value_op_allowed_iff_no_target_lag`, and `kani_trade_cpi_pre_cpi_allowed_despite_post_read_lag`
 - partial crank state persistence: `kani_partial_crank_config_write_field_sources`
 - live insurance withdrawal health/residual gate: `kani_live_insurance_withdraw_residual_gate_is_preserved_by_withdrawal`, `kani_live_insurance_withdraw_market_health_rejects_stress_envelope`, and `kani_live_insurance_withdraw_residual_gate_rejects_senior_overflow`
 - permissionless resolve horizon policy: `kani_permissionless_resolve_horizon_policy_independent_from_accrual_window`

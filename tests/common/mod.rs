@@ -773,6 +773,17 @@ pub fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
     data
 }
 
+pub fn encode_trade_with_exec_price(
+    lp: u16,
+    user: u16,
+    size: i128,
+    exec_price_e6: u64,
+) -> Vec<u8> {
+    let mut data = encode_trade(lp, user, size);
+    data.extend_from_slice(&exec_price_e6.to_le_bytes());
+    data
+}
+
 pub fn encode_crank_permissionless() -> Vec<u8> {
     let mut data = vec![5u8];
     data.extend_from_slice(&u16::MAX.to_le_bytes()); // caller_idx = permissionless
@@ -2548,9 +2559,9 @@ impl TestEnv {
 /// the market would have no valid price and trades would fail with OracleInvalid.
 /// This test verifies the validation in InitMarket rejects this configuration.
 
-// Hyperp security stubs (TradeNoCpi disabled, exec_price clamping,
-// default oracle_price_cap, index smoothing) — documented in MEMORY.md.
-// Verified by code inspection + Kani proofs for clamp_toward_with_dt.
+// Hyperp security stubs (bilateral TradeNoCpi authorization, mark-impact
+// clamping, default oracle_price_cap, index smoothing) — documented in
+// MEMORY.md. Verified by code inspection + Kani proofs for clamp_toward_with_dt.
 
 /// Test: Hyperp mode InitMarket succeeds with valid initial_mark_price
 
@@ -5064,8 +5075,8 @@ impl TestEnv {
 /// Instead, this test directly sets side_mode_long = DrainOnly (1) via raw byte
 /// manipulation of the slab, then verifies the gating and error code mapping.
 
-/// ATTACK: Execute TradeNoCpi in Hyperp mode (should be blocked).
-/// Expected: Program rejects TradeNoCpi for Hyperp markets.
+/// Hyperp TradeNoCpi is bilateral: both owners sign directly, and the
+/// engine still enforces health while mark impact is clamped.
 
 /// ATTACK: Trade after market is resolved.
 /// Expected: No new trades on resolved markets.
@@ -6652,8 +6663,7 @@ impl TestEnv {
 /// ATTACK: Resolve hyperp market then withdraw capital (no position).
 /// After resolution, users should be able to withdraw their deposited capital.
 
-/// ATTACK: TradeNoCpi on hyperp market should always be blocked.
-/// Hyperp mode blocks TradeNoCpi (requires TradeCpi from matcher).
+/// Hyperp TradeNoCpi is not matcher-gated; both owners sign directly.
 
 // test_attack_double_resolve_rejected: removed (duplicate of test_attack_double_resolve_market)
 

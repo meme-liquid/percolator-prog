@@ -266,28 +266,21 @@ fn test_trade_nocpi_requires_crank_for_exposed_price_progress() {
     let target = (env.read_last_effective_price() + 1) as i64;
     env.set_slot_and_price_raw_no_walk(next_slot, target);
 
-    let err = env
-        .try_trade(
-            &walker_user,
-            &walker_lp,
-            walker_lp_idx,
-            walker_user_idx,
-            1_000,
-        )
-        .expect_err("nonzero TradeNoCpi must not be a hidden crank path");
-    assert_custom_error(
-        &err,
-        "0x1d",
-        "TradeNoCpi must reject exposed market progress before the crank cascade",
-    );
-    assert_eq!(
-        env.read_last_market_slot(),
-        slot_before,
-        "rejected TradeNoCpi must not advance exposed market time",
+    env.try_trade(
+        &walker_user,
+        &walker_lp,
+        walker_lp_idx,
+        walker_user_idx,
+        1_000,
+    )
+    .expect("TradeNoCpi is a consenting liveness path during exposed market progress");
+    assert!(
+        env.read_last_market_slot() > slot_before,
+        "accepted TradeNoCpi should advance exposed market time through the engine",
     );
 
     env.try_crank()
-        .expect("KeeperCrank must own exposed market progress");
+        .expect("KeeperCrank should remain able to make progress after TradeNoCpi");
     env.try_trade(
         &walker_user,
         &walker_lp,

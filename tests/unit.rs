@@ -387,6 +387,12 @@ fn encode_trade(lp: u16, user: u16, size: i128) -> Vec<u8> {
     data
 }
 
+fn encode_trade_with_exec_price(lp: u16, user: u16, size: i128, exec_price_e6: u64) -> Vec<u8> {
+    let mut data = encode_trade(lp, user, size);
+    encode_u64(exec_price_e6, &mut data);
+    data
+}
+
 fn encode_trade_cpi(lp: u16, user: u16, size: i128) -> Vec<u8> {
     let mut data = vec![10u8];
     encode_u16(lp, &mut data);
@@ -399,6 +405,48 @@ fn encode_set_risk_threshold(new_threshold: u128) -> Vec<u8> {
     let mut data = vec![11u8];
     encode_u128(new_threshold, &mut data);
     data
+}
+
+#[test]
+fn test_trade_nocpi_optional_exec_price_tail_decodes() {
+    match Instruction::decode(&encode_trade(2, 3, -123)).expect("legacy TradeNoCpi must decode") {
+        Instruction::TradeNoCpi {
+            lp_idx,
+            user_idx,
+            size,
+            exec_price_e6,
+        } => {
+            assert_eq!(lp_idx, 2);
+            assert_eq!(user_idx, 3);
+            assert_eq!(size, -123);
+            assert_eq!(exec_price_e6, 0);
+        }
+        other => panic!("unexpected decode: {other:?}"),
+    }
+
+    match Instruction::decode(&encode_trade_with_exec_price(4, 5, 456, 123_456_789))
+        .expect("extended TradeNoCpi must decode")
+    {
+        Instruction::TradeNoCpi {
+            lp_idx,
+            user_idx,
+            size,
+            exec_price_e6,
+        } => {
+            assert_eq!(lp_idx, 4);
+            assert_eq!(user_idx, 5);
+            assert_eq!(size, 456);
+            assert_eq!(exec_price_e6, 123_456_789);
+        }
+        other => panic!("unexpected decode: {other:?}"),
+    }
+
+    let mut trailing = encode_trade_with_exec_price(4, 5, 456, 123_456_789);
+    trailing.push(1);
+    assert!(
+        Instruction::decode(&trailing).is_err(),
+        "TradeNoCpi must reject malformed trailing bytes after optional exec price"
+    );
 }
 
 fn encode_update_admin(new_admin: &Pubkey) -> Vec<u8> {
@@ -952,14 +1000,40 @@ fn test_init_market_dynamic_fee_tail_decodes_after_extended_tail() {
 }
 
 #[test]
-fn test_external_oracle_market_rejects_dynamic_fee_tail() {
+fn test_init_market_three_leg_oracle_tail_can_enable_hybrid_dynamic_fee() {
+    let f = setup_market();
+    let mut data = encode_init_market(&f, 50);
+    let leg2 = [0x22u8; 32];
+    let leg3 = [0x33u8; 32];
+    let flags = percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG2
+        | percolator_prog::constants::ORACLE_LEG_FLAG_DIVIDE_LEG3;
+    data.push(3u8);
+    data.push(flags);
+    data.extend_from_slice(&leg2);
+    data.extend_from_slice(&leg3);
+    data.extend_from_slice(&1u64.to_le_bytes());
+
+    match Instruction::decode(&data).expect("oracle-leg + dynamic-fee tails must decode") {
+        Instruction::InitMarket(args) => {
+            assert_eq!(args.oracle_leg_count, 3);
+            assert_eq!(args.oracle_leg_flags, flags);
+            assert_eq!(args.oracle_leg_feeds.leg2_feed_id, leg2);
+            assert_eq!(args.oracle_leg_feeds.leg3_feed_id, leg3);
+            assert_eq!(args.trade_fee_base_bps, 1);
+        }
+        other => panic!("unexpected instruction: {other:?}"),
+    }
+}
+
+#[test]
+fn test_external_oracle_market_accepts_dynamic_fee_tail_as_hybrid_after_hours() {
     let mut f = setup_market();
     let mut data = encode_init_market(&f, 50);
     overwrite_init_market_max_trade_fee_bps(
         &mut data,
         percolator_prog::constants::MAX_DYNAMIC_TRADE_FEE_BPS,
     );
-    data.extend_from_slice(&1u64.to_le_bytes()); // base < max requests dynamic mode
+    data.extend_from_slice(&1u64.to_le_bytes()); // base < max requests hybrid dynamic mode
 
     let accounts = vec![
         f.admin.to_info(),
@@ -972,14 +1046,15 @@ fn test_external_oracle_market_rejects_dynamic_fee_tail() {
     let res = process_instruction(&f.program_id, &accounts, &data);
     assert_eq!(
         res,
-        Err(PercolatorError::InvalidConfigParam.into()),
-        "dynamic mark-movement fees are Hyperp-only; external markets must use base == max"
+        Ok(()),
+        "external dynamic tail should enable hybrid mode"
     );
-    assert_ne!(
-        state::read_header(&f.slab.data).magic,
-        MAGIC,
-        "rejected init must not initialize the slab"
-    );
+    let config = state::read_config(&f.slab.data);
+    assert_eq!(config.index_feed_id, f.index_feed_id);
+    assert_eq!(config.trade_fee_base_bps, 1);
+    assert_eq!(config.mark_ewma_e6, config.last_effective_price_e6);
+    assert_eq!(config.hyperp_mark_e6, config.last_effective_price_e6);
+    assert_eq!(state::read_header(&f.slab.data).magic, MAGIC);
 }
 
 #[test]

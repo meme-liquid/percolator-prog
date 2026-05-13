@@ -295,13 +295,8 @@ fn test_a1_external_pyth_raw_gap_move_defended() {
 
 /// A1b: Hyperp (internal mark) market.
 ///
-/// On a Hyperp market, `TradeNoCpi` is explicitly disabled
-/// (`HyperpTradeNoCpiDisabled`, error 0x1b) — positions can only be
-/// opened through `TradeCpi` with a registered matcher program. That
-/// makes the classic dual-keypair matched-pair setup impossible on
-/// Hyperp without the external `matcher_program.so` binary (see A1c).
-///
-/// What we *can* verify here is the closest independent surface: the
+/// Hyperp now supports direct bilateral `TradeNoCpi`, but this regression
+/// keeps exercising the authority-only surface: the
 /// hyperp mark-push authority cannot siphon insurance even when it
 /// adversely pushes the mark by ~25%, because every push is rate-
 /// limited by the engine's mark-smoothing cap
@@ -337,8 +332,8 @@ fn test_a1_hyperp_mark_siphon_defended() {
     env.crank();
     let insurance_before = env.read_insurance_balance();
 
-    // NOTE: no trade — TradeNoCpi is blocked on Hyperp, and TradeCpi needs
-    // an external matcher program (A1c). Exercise the authority-only flavor.
+    // NOTE: no trade here; this specific regression exercises the
+    // authority-only flavor independently from bilateral Hyperp trading.
 
     // Push the hyperp mark ~25% adverse over many small steps; each push
     // is rate-limited by the engine's mark-smoothing cap. Some steps will
