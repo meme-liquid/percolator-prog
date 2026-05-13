@@ -4702,8 +4702,10 @@ pub mod processor {
         exec_price: u64,
         trade_size: i128,
     ) -> Result<u64, ProgramError> {
+        let hybrid_after_hours_fallback = oracle::is_hybrid_after_hours_mode(config)
+            && oracle::hybrid_soft_stale_matured(config, now_slot);
         let dynamic_mark_fee_enabled = (oracle::is_hyperp_mode(config)
-            || oracle::is_hybrid_after_hours_mode(config))
+            || hybrid_after_hours_fallback)
             && config.trade_fee_base_bps < engine.params.max_trading_fee_bps;
         if !dynamic_mark_fee_enabled {
             return Ok(config.trade_fee_base_bps);
@@ -4745,6 +4747,17 @@ pub mod processor {
             min_externality_bps,
         )
         .ok_or(PercolatorError::InvalidConfigParam.into())
+    }
+
+    #[inline]
+    fn trade_flow_mark_observation_enabled(config: &MarketConfig, now_slot: u64) -> bool {
+        // Ordinary external markets and Hyperp markets use trade flow as the
+        // mark/funding observation source. Hybrid markets are different:
+        // regular-hours fresh/duplicate oracle reads own the mark baseline,
+        // and trade flow may update the EWMA only once the wrapper is actually
+        // in stale-oracle after-hours fallback.
+        !oracle::is_hybrid_after_hours_mode(config)
+            || oracle::hybrid_soft_stale_matured(config, now_slot)
     }
 
     fn safe_mul_div_floor_u128(a: u128, b: u128, d: u128) -> Result<u128, ProgramError> {
@@ -7875,7 +7888,7 @@ pub mod processor {
                 // price-flexibility semantics.
                 // Per-slot price-move cap is init-immutable (engine RiskParams).
                 let max_change_bps = engine.params.max_price_move_bps_per_slot;
-                if max_change_bps > 0 {
+                if max_change_bps > 0 && trade_flow_mark_observation_enabled(&config, clock.slot) {
                     let clamped_price = oracle::clamp_oracle_price(
                         crate::policy::mark_ewma_clamp_base(config.last_effective_price_e6),
                         exec_price,
@@ -8498,10 +8511,15 @@ pub mod processor {
                     // whether the mark actually moved.
                     let old_ewma_cpi = config.mark_ewma_e6;
                     let mut trade_mark_moved_cpi = false;
-                    // Update trade-derived mark EWMA (all market types).
+                    // Update trade-derived mark EWMA when this market mode
+                    // accepts trade flow as a mark observation. Hybrid
+                    // regular-hours reads are excluded: the external oracle
+                    // owns the mark baseline until stale fallback is active.
                     // Per-slot price-move cap is init-immutable (engine RiskParams).
                     let max_change_bps_cpi = engine.params.max_price_move_bps_per_slot;
-                    if max_change_bps_cpi > 0 {
+                    if max_change_bps_cpi > 0
+                        && trade_flow_mark_observation_enabled(&config, clock.slot)
+                    {
                         let clamped_exec = oracle::clamp_oracle_price(
                             crate::policy::mark_ewma_clamp_base(config.last_effective_price_e6),
                             ret.exec_price_e6,

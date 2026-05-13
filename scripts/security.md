@@ -1,5 +1,48 @@
 # Security findings — 2026-05-13 hybrid after-hours sweep
 
+## F7 — Hybrid regular-hours duplicate oracle must not become trade-owned mark (Medium)
+
+**Status:** fixed locally by making hybrid trade-derived mark updates and dynamic
+mark fees active only in the stale-oracle fallback branch. Regression coverage:
+
+```bash
+cargo build-sbf --no-default-features
+cargo test --release --test test_tradecpi \
+  test_external_hybrid_fresh_duplicate_oracle_uses_external_mark_not_trade_mark \
+  -- --nocapture
+cargo test --release --test test_tradecpi external_hybrid -- --nocapture
+```
+
+**Attacker model:** a trader controls both signed bilateral accounts or a
+matcher quote, and can submit a still-fresh but duplicate Pyth Pull update
+inside the regular-hours staleness window. The market is configured for hybrid
+after-hours mode, so the external oracle should own the mark while it is fresh,
+and trade flow should own the EWMA only after soft-stale fallback starts.
+
+**Original issue:** if the Pyth account's publish time was unchanged but still
+inside `max_staleness_secs`, `read_price_and_stamp` accepted the external
+baseline without advancing `last_good_oracle_slot`. A wide `TradeNoCpi` or
+matcher fill in a later slot could then move `mark_ewma_e6` and pay a dynamic
+mark fee even though the market had not entered after-hours fallback.
+
+**Fix invariant:**
+
+```text
+Hybrid fresh/duplicate oracle branch:
+  mark_ewma_e6 remains pinned to the accepted external baseline;
+  mark_ewma_last_slot is not refreshed by trade flow;
+  trade fee is the configured base fee.
+
+Hybrid soft-stale fallback branch:
+  consenting arbitrary-price trades remain live;
+  trade flow may move EWMA subject to clamp + fee weighting;
+  fee includes the stale-fallback uncertainty floor.
+```
+
+**Disposition:** `PASS_SAFE` after fix. The hybrid branch now has a clean
+regular-hours/after-hours split: regular hours are oracle-owned, after hours are
+trade-owned with dynamic externality fees.
+
 ## F5 — Hybrid stale-fallback trade must pay the next-step uncertainty floor (High)
 
 **Status:** fixed locally by keeping the flexible trade path and charging a stale-fallback uncertainty floor. Regression coverage:

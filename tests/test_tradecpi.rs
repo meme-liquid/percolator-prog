@@ -7419,6 +7419,61 @@ fn test_external_hybrid_tradenocpi_wide_exec_price_charges_dynamic_fee() {
 }
 
 #[test]
+fn test_external_hybrid_fresh_duplicate_oracle_uses_external_mark_not_trade_mark() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let user_a = Keypair::new();
+    let user_a_idx = env.init_user(&user_a);
+    env.deposit(&user_a, user_a_idx, 1_000_000_000_000);
+
+    let user_b = Keypair::new();
+    let user_b_idx = env.init_user(&user_b);
+    env.deposit(&user_b, user_b_idx, 1_000_000_000_000);
+
+    // The Pyth account still carries its init publish_time=100 and is
+    // well inside max_staleness_secs=10 at slot 105. This is a regular-hours
+    // duplicate observation, not the hybrid after-hours fallback.
+    set_tradecpi_clock_only(&mut env, 105);
+    let cfg_before = read_market_config(&env);
+    assert!(
+        !percolator_prog::oracle::hybrid_soft_stale_matured(&cfg_before, 105),
+        "test setup must remain before hybrid soft-stale fallback"
+    );
+
+    let insurance_before = env.read_insurance_balance();
+    let exec_price = cfg_before.last_effective_price_e6 * 105 / 100;
+    let size = 10_000_000i128;
+
+    try_trade_nocpi_with_exec_price_in_tradecpi_env(
+        &mut env,
+        &user_a,
+        &user_b,
+        user_b_idx,
+        user_a_idx,
+        size,
+        exec_price,
+    )
+    .expect("fresh duplicate external-oracle TradeNoCpi should execute");
+
+    let cfg_after = read_market_config(&env);
+    let insurance_after = env.read_insurance_balance();
+    assert_eq!(
+        cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
+        "regular-hours hybrid must keep the mark pinned to the external oracle baseline"
+    );
+    assert_eq!(
+        cfg_after.mark_ewma_last_slot, cfg_before.mark_ewma_last_slot,
+        "regular-hours duplicate oracle trades must not stamp the fallback EWMA clock"
+    );
+    assert_eq!(
+        insurance_after - insurance_before,
+        two_sided_fee_for_trade(size, exec_price, 1),
+        "regular-hours hybrid trades must pay only the configured base fee"
+    );
+}
+
+#[test]
 fn test_hyperp_tradenocpi_accepts_consented_exec_price_and_updates_mark() {
     let mut env = TradeCpiTestEnv::new();
     init_hyperp_with_dynamic_fee(&mut env, 1_000_000, 10_000, 1, 0);
